@@ -68,7 +68,7 @@ def magi_attn_varlen_key(
         cp_mesh (DeviceMesh): process mesh, only support 1D or 2D mesh for now
         NOTE: cp_group and cp_mesh are mutually exclusive, one and only one of them needs be provided.
 
-        causal(bool): if True, all attn_mask_type is CASUAL. else, all attn_mask_type is FULL.
+        causal(bool): if True, all attn_mask_type is CAUSAL. else, all attn_mask_type is FULL.
         dist_attn_config (DistAttnConfig): dist attn config.
 
     Returns:
@@ -180,6 +180,9 @@ def magi_attn_varlen_dispatch(
 
         cp_group (dist.ProcessGroup): process group, only support nccl backend for now.
         cp_mesh (DeviceMesh): process mesh, only support 1D or 2D mesh for now
+        NOTE: cp_group and cp_mesh are mutually exclusive, one and only one of them needs be provided.
+
+        causal(bool): if True, all attn_mask_type is CAUSAL. else, all attn_mask_type is FULL.
         dist_attn_config (DistAttnConfig): dist attn config.
 
     Returns:
