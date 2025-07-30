@@ -1,9 +1,10 @@
 # MagiAttention
 
 <p align="center">
-    <a href="https://static.magi.world/static/files/MAGI_1.pdf"><img alt="paper" src="https://img.shields.io/badge/Paper-Magi_1-red"></a>
+    <a href="https://arxiv.org/pdf/2505.13211"><img alt="paper" src="https://img.shields.io/badge/Paper-Magi_1-red"></a>
+    <a href="https://SandAI-org.github.io/MagiAttention/docs/"><img alt="docs" src="https://img.shields.io/badge/Docs-MagiAttention-green"></a>
     <a href="https://SandAI-org.github.io/MagiAttention/blog/"><img alt="blog" src="https://img.shields.io/badge/Blog-MagiAttention-purple"></a>
-    <a href="https://github.com/SandAI-org/MagiAttention/releases"><img alt="license" src="https://img.shields.io/badge/Release-v1.0.0-blue"></a>
+    <a href="https://github.com/SandAI-org/MagiAttention/releases"><img alt="license" src="https://img.shields.io/badge/Release-v1.0.3-blue"></a>
 </p>
 
 <p align="center">
@@ -30,7 +31,10 @@ A Distributed Attention Towards Linear Scalability for Ultra-Long Context, Heter
 
 ## Latest News 🔥
 
-- [2025/5] We support overlapped q_ranges when all mask types are `FULL` (see [v1.0.1 release note](https://github.com/SandAI-org/MagiAttention/releases/tag/v1.0.1) for more details), and release the example code to **integrate Megatron with MagiAttention** with several training convergence experiments (see [here](./example/megatron/README.md) for more details).
+
+- [2025/7] 🚀 We release [MagiAttention-v1.0.3](https://github.com/SandAI-org/MagiAttention/tree/v1.0.3) with improvements including [documentation](https://SandAI-org.github.io/MagiAttention/docs/), support for all four mask types with arbitary overlapping, deterministic mode, API updates, FFA performance enhancements with bug fixes, optimized dispatch solvers, hierarchical-comm support, and example codes to train Llama-3 1B model with MagiAttention + FSDP / Transformers.
+- [2025/6] 📌 We release [MagiAttention-v1.0.2](https://github.com/SandAI-org/MagiAttention/tree/v1.0.2) to provide the example code to **integrate Megatron with MagiAttention** with several training convergence experiments (*see [here](./example/megatron/README.md) for more details*), with some bug fixes and a simple roadmap.
+- [2025/5] 📌 We release [MagiAttention-v1.0.1](https://github.com/SandAI-org/MagiAttention/tree/v1.0.1) to support overlapped q_ranges when all mask types are `FULL`, with some code cleanup and bug fixes.
 - [2025/4] 🎉 We release [MagiAttention-v1.0.0](https://github.com/SandAI-org/MagiAttention/tree/v1.0.0) with its [blog](https://SandAI-org.github.io/MagiAttention/blog/): a distributed attention towards linear scalability for ultra-long context, heterogeneous mask training.
 
 
@@ -59,10 +63,14 @@ For implementation details, more experimental results and future works, please v
 
 - [ ] Optimize `Flex-Flash-Attention` kernels to improve performance and better support sparse attention (*such as [NSA](https://arxiv.org/pdf/2502.11089)*)
 - [ ] Support native `GroupCast` and `GroupReduce` kernels and hierarchical communication optimization (*similar to [DeepEP](https://github.com/deepseek-ai/DeepEP)*)
-- [ ] Refactor `Distributed Attention Solver` as well as `Flex-Flash-Attention` kernel arguments to support all mask types with all kinds of overlap, and reduce CPU overhead for meta info calculation
-- [ ] Improve `Dispatch Solver` to reduce necessary communication volumn while remaining balance in computation (*especially for varlen mask patterns*)
-- [ ] Build a comprehensive `CP Benchmark` to better compare the performance of different context parallel strategies under various mask patterns and other training configurations
-- [ ] Provide `Documentation` including `API reference` and `User Guide`, with a more detailed technical blog
+- [ ] Optimize `Distributed Attention Solver` to reduce CPU overhead for meta info calculation and support better comp-/comm- overlapping.
+- [ ] Provide a more comprehensive documentation with tutorials, and a more detailed technical blog.
+- [ ] Provide more example codes and recipes for various training scenarios.
+- [ ] Upgrade MagiAttention to a distributed native Flex-Flash-Attention kernel (*as a major version update*).
+- [x] Refactor `Distributed Attention Solver` to support all mask types with all kinds of overlap.
+- [x] Improve `Dispatch Solver` to reduce necessary communication volumn while remaining balance in computation (*especially for varlen mask patterns*).
+- [x] Build a comprehensive `CP Benchmark` to better compare the performance of different context parallel strategies under various mask patterns and other training configurations.
+- [x] Provide `Documentation` including `Installation`, `QuickStart` and `API reference`.
 
 
 ## Installation ⚙️
@@ -201,6 +209,7 @@ For more usage instructions, you can refer to `magi_attention/functional/flex_fl
   num_heads_kv = 8           # number of key/value heads (GQA)
   head_dim = 128             # dimension of each attention head
   dtype = torch.bfloat16     # attention activation / computation dtype (while the reduction dtype for partial attention outputs is always fp32 for magi_attention right now)
+  chunk_size = 512           # chunk size to chunk the input tensor x along the seqlen dim for dispatch to control the granularity of computation load-balance.
 
   # --- Initialize token embedding tensor --- #
 
@@ -248,10 +257,10 @@ For more usage instructions, you can refer to `magi_attention/functional/flex_fl
   )
   attn_mask_type = [AttnMaskType.FULL] * len(q_ranges)
   total_seqlen_q = total_seqlen_k = total_seqlen
-  pad_size, _ = compute_pad_size( # pad embeds along seqlen dim for better performance
+  pad_size = compute_pad_size( # pad embeds along seqlen dim for better performance
     total_seqlen_q=total_seqlen_q,
     cp_size=world_size, # assuming we only have 1-dim context parallelism (cp)
-    head_dim=head_dim,
+    chunk_size=chunk_size,
   )
 
   # --- Dispatch token embedding tensor along seqlen dim to multiple ranks --- #
@@ -269,9 +278,9 @@ For more usage instructions, you can refer to `magi_attention/functional/flex_fl
       attn_mask_type=attn_mask_type,
       total_seqlen_q=total_seqlen_q,
       total_seqlen_k=total_seqlen_k,
-      head_dim=head_dim,
       pad_size=pad_size,
-      cp_group=world_group, # assuming we only have 1-dim context parallelism (cp)
+      chunk_size=chunk_size,
+      cp_group_or_mesh=world_group, # assuming we only have 1-dim context parallelism (cp)
   )
 
   # --- Simulate QKV projection --- #
@@ -334,9 +343,10 @@ We provide an example of how to integrate magi_attention with transformers in `e
 
 For more information, you can refer to `example/transformers/README.md`.
 
+
 ## Documentation
 
-Coming soon ...
+Please check [here](https://SandAI-org.github.io/MagiAttention/docs/).
 
 
 ## Performance Benchmarks 📊
@@ -453,19 +463,20 @@ If you use MagiAttention in your research, please cite:
 
 We are grateful to the contributors listed below for their valuable contributions during the early stages of MagiAttention.
 
-| Member   | Affiliations         | Email                        | GitHub Account    |
-|:-----------|:-------------|:----------------------------|:---------------|
-| Zewei Tao    | SandAI       | zeweitao@sand.ai            | littsk         |
-| Yunpeng Huang    | SandAI, Nanjing University       | yunpenghuang@sand.ai,hyp@smail.nju.edu.cn       | Strivin0311    |
-| Qiangang Wang    | Nanjing University | 522024330081@smail.nju.edu.cn | WT1W           |
-| Hanwen Sun   | SandAI, Peking University |  sunhanwen@stu.pku.edu.cn |  hanwen-sun  |
-| Tao Bu      | Nanjing University | 502024330002@smail.nju.edu.cn | Big-TRex       |
-| WenYang Fang    | Nanjing University | fwy@smail.nju.edu.cn        | kagami4243     |
-| Siyuang Yan    | Nanjing University | siyuanyan@smail.nju.edu.cn  | FibonaccciYan  |
-| Zixu Jiang     | Nanjing University | 522023330040@smail.nju.edu.cn | 191220042      |
-| Dingkun Xu    | Nanjing University | 211220090@smail.nju.edu.cn  | PureDimension  |
-| Mingyu Liang    | Nanjing University |   mingyuliang518@gmail.com     | gaomusiki      |
-| Jingwei Xu    | Nanjing University | jingweix@nju.edu.cn | paragonlight   |
+| Member        | Affiliations                | Email                           | GitHub Account |
+| :------------ | :-------------------------- | :------------------------------ | :------------- |
+| Zewei Tao     | SandAI                      | <zeweitao@sand.ai>              | littsk         |
+| Yunpeng Huang | SandAI                      | <yunpenghuang@sand.ai>          | Strivin0311    |
+| Qiangang Wang | SandAI, Nanjing University  | <522024330081@smail.nju.edu.cn> | WT1W           |
+| Hanwen Sun    | SandAI, Peking University   | <sunhanwen@stu.pku.edu.cn>      | hanwen-sun     |
+| Jin Li        | SandAI, Tsinghua University | <2609835176@qq.com>             | lijinnn        |
+| Tao Bu        | Nanjing University          | <502024330002@smail.nju.edu.cn> | Big-TRex       |
+| WenYang Fang  | Nanjing University          | <fwy@smail.nju.edu.cn>          | kagami4243     |
+| Siyuang Yan   | Nanjing University          | <siyuanyan@smail.nju.edu.cn>    | FibonaccciYan  |
+| Zixu Jiang    | Nanjing University          | <522023330040@smail.nju.edu.cn> | 191220042      |
+| Dingkun Xu    | Nanjing University          | <211220090@smail.nju.edu.cn>    | PureDimension  |
+| Mingyu Liang  | Nanjing University          | <mingyuliang518@gmail.com>      | gaomusiki      |
+| Jingwei Xu    | Nanjing University          | <jingweix@nju.edu.cn>           | paragonlight   |
 
 
 ## Star History

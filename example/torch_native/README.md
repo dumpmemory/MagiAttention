@@ -1,6 +1,6 @@
 ## integrate MagiAttention with FSDP
 
-We provide a toy example in this direcotry to show you how to integrate MagiAttention with FSDP to train a llama-1b model on randomly generated input data.
+We provide a toy example in this direcotry to show you how to integrate MagiAttention with FSDP to train a Llama-3 1B model on randomly generated input data.
 
 ### modeling llama
 We provide an native inplementation of llama model in `modeling_llama.py`.
@@ -108,7 +108,7 @@ def train(model, optimizer, lr_scheduler, device_mesh, train_iter):
         ):
             # dispatched input and prepare magi_attn key.
             input, dist_attn_runtime_key = prepare_magi_attention(
-                input, cu_seqlens_q, cu_seqlens_k, pad_size, device_mesh.get_group("cp")
+                input, cu_seqlens_q, cu_seqlens_k, pad_size, CHUNK_SIZE, device_mesh.get_group("cp")
             )
 
         output = model(input, dist_attn_runtime_key)
@@ -148,7 +148,7 @@ def prepare_data(device_mesh, train_iter):
     head_dim = LlamaConfig().head_dim
 
     # pad seqlen of input data for better performance.
-    pad_size, _ = compute_pad_size(local_input.size(0), cp_size, head_dim)
+    pad_size = compute_pad_size(local_input.size(0), cp_size, CHUNK_SIZE)
     cu_seqlens_q, cu_seqlens_k = full_attention_to_varlen_attention(
         batch_size // dp_size, seqlen
     )
@@ -169,9 +169,9 @@ def prepare_magi_attention(input, cu_seqlens_q, cu_seqlens_k, pad_size, cp_group
         input,
         cu_seqlens_q,
         cu_seqlens_k,
-        head_dim=LlamaConfig().head_dim,
         pad_size=pad_size,
-        cp_group=cp_group,
+        chunk_size=CHUNK_SIZE,
+        cp_group_or_mesh=cp_group,
         causal=LlamaConfig().is_causal,
         dist_attn_config=dist_attn_config,
     )

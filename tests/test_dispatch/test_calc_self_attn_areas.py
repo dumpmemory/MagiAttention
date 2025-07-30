@@ -23,8 +23,51 @@ from magi_attention.common.range import AttnRange
 from magi_attention.meta._calc_dispatch_meta import _calc_self_attn_areas
 from magi_attention.meta.container import AttnBucket, AttnChunk, AttnSlice
 from magi_attention.testing import parameterize
-from magi_attention.testing.utils import add_range_to_array
-from magi_attention.utils._utils import argsort
+from magi_attention.utils import argsort
+
+
+def add_range_to_array(
+    array: np.ndarray,
+    q_range: AttnRange,
+    k_range: AttnRange,
+    masktype: AttnMaskType = AttnMaskType.FULL,
+    check: bool = False,
+):
+    # get start and end of range
+    x_start, x_end = q_range.start, q_range.end
+    y_start, y_end = k_range.start, k_range.end
+
+    if check:
+        # check whether the current slice has been filled
+        assert np.all(array[x_start:x_end, y_start:y_end] == 0), (
+            f"Part of the area has been added," f"when {q_range=} and {k_range=}"
+        )
+
+    # fill the area according to the type of the mask.
+    for i in range(x_start, x_end):
+        for j in range(y_start, y_end):
+            if masktype == AttnMaskType.FULL:
+                array[i][j] = 1
+            elif masktype == AttnMaskType.CAUSAL:
+                b = y_end - x_end
+                fx = i + b
+                if j <= fx:
+                    array[i][j] = 1
+            elif masktype == AttnMaskType.INVCAUSAL:
+                b = y_start - x_start
+                fx = i + b
+                if j >= fx:
+                    array[i][j] = 1
+            elif masktype == AttnMaskType.BICAUSAL:
+                causal_b = y_end - x_end
+                f_causal = i + causal_b
+
+                inv_causal_b = y_start - x_start
+                f_inv_causal = i + inv_causal_b
+                if j <= f_causal and j >= f_inv_causal:
+                    array[i][j] = 1
+
+    return array
 
 
 class TestCalcSelfAttnAreas(TestCase):
@@ -82,6 +125,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=88,
                         ),
                     ],
+                    sample_ids=[0],
                 ),
                 AttnChunk(
                     chunk_id=1,
@@ -101,6 +145,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=63,
                         ),
                     ],
+                    sample_ids=[0, 1],
                 ),
                 AttnChunk(
                     chunk_id=2,
@@ -113,6 +158,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=36,
                         ),
                     ],
+                    sample_ids=[2],
                 ),
                 AttnChunk(
                     chunk_id=3,
@@ -132,6 +178,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=3,
                         ),
                     ],
+                    sample_ids=[2, 3],
                 ),
                 AttnChunk(
                     chunk_id=4,
@@ -144,6 +191,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=52,
                         ),
                     ],
+                    sample_ids=[3],
                 ),
                 AttnChunk(
                     chunk_id=5,
@@ -163,6 +211,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=95,
                         ),
                     ],
+                    sample_ids=[3, 4],
                 ),
                 AttnChunk(
                     chunk_id=6,
@@ -175,6 +224,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=152,
                         ),
                     ],
+                    sample_ids=[4],
                 ),
                 AttnChunk(
                     chunk_id=7,
@@ -194,6 +244,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=33,
                         ),
                     ],
+                    sample_ids=[4, 5],
                 ),
             ]
         )
@@ -201,7 +252,7 @@ class TestCalcSelfAttnAreas(TestCase):
         assert global_bucket == result_bucket, (
             f"The test of testcase one is not passed!\n"
             f"expect result={result_bucket}\n"
-            f"but get {global_bucket}."
+            f"but got {global_bucket}."
         )
 
     def test_calc_self_attn_areas_two(self):
@@ -281,6 +332,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=6,
                         ),
                     ],
+                    sample_ids=[0, 1, 2],
                 ),
                 AttnChunk(
                     chunk_id=1,
@@ -307,6 +359,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=15,
                         ),
                     ],
+                    sample_ids=[3, 4, 5],
                 ),
                 AttnChunk(
                     chunk_id=2,
@@ -326,6 +379,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=3,
                         ),
                     ],
+                    sample_ids=[6, 7],
                 ),
                 AttnChunk(
                     chunk_id=3,
@@ -345,6 +399,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=36,
                         ),
                     ],
+                    sample_ids=[7, 8],
                 ),
             ]
         )
@@ -352,7 +407,7 @@ class TestCalcSelfAttnAreas(TestCase):
         assert global_bucket == result_bucket, (
             f"The test in testcase one is not passed!\n"
             f"expect result={result_bucket}\n"
-            f"but get {global_bucket}."
+            f"but got {global_bucket}."
         )
 
     def test_calc_self_attn_areas_all_full(self):
@@ -408,6 +463,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=120,
                         ),
                     ],
+                    sample_ids=[0],
                 ),
                 AttnChunk(
                     chunk_id=1,
@@ -420,6 +476,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=144,
                         ),
                     ],
+                    sample_ids=[1],
                 ),
                 AttnChunk(
                     chunk_id=2,
@@ -439,6 +496,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=124,
                         ),
                     ],
+                    sample_ids=[1, 2],
                 ),
                 AttnChunk(
                     chunk_id=3,
@@ -451,6 +509,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=496,
                         ),
                     ],
+                    sample_ids=[2],
                 ),
                 AttnChunk(
                     chunk_id=4,
@@ -470,6 +529,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=102,
                         ),
                     ],
+                    sample_ids=[2, 3],
                 ),
                 AttnChunk(
                     chunk_id=5,
@@ -482,6 +542,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=408,
                         ),
                     ],
+                    sample_ids=[3],
                 ),
                 AttnChunk(
                     chunk_id=6,
@@ -501,6 +562,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=95,
                         ),
                     ],
+                    sample_ids=[3, 4],
                 ),
                 AttnChunk(
                     chunk_id=7,
@@ -513,6 +575,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=224,
                         ),
                     ],
+                    sample_ids=[5],
                 ),
                 AttnChunk(
                     chunk_id=8,
@@ -525,6 +588,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=152,
                         ),
                     ],
+                    sample_ids=[6],
                 ),
                 AttnChunk(
                     chunk_id=9,
@@ -537,6 +601,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=744,
                         ),
                     ],
+                    sample_ids=[7],
                 ),
                 AttnChunk(
                     chunk_id=10,
@@ -549,6 +614,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=744,
                         ),
                     ],
+                    sample_ids=[7],
                 ),
                 AttnChunk(
                     chunk_id=11,
@@ -568,6 +634,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=294,
                         ),
                     ],
+                    sample_ids=[7, 8],
                 ),
             ]
         )
@@ -575,7 +642,7 @@ class TestCalcSelfAttnAreas(TestCase):
         assert global_bucket == result_bucket, (
             f"The test of all full is not passed!\n"
             f"expect result={result_bucket}\n"
-            f"but get {global_bucket}."
+            f"but got {global_bucket}."
         )
 
     def test_calc_self_attn_areas_all_causal_1(self):
@@ -627,6 +694,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=36,
                         ),
                     ],
+                    sample_ids=[0],
                 ),
                 AttnChunk(
                     chunk_id=1,
@@ -639,6 +707,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=36,
                         ),
                     ],
+                    sample_ids=[1],
                 ),
                 AttnChunk(
                     chunk_id=2,
@@ -651,6 +720,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=100,
                         ),
                     ],
+                    sample_ids=[1],
                 ),
                 AttnChunk(chunk_id=3, q_slices=[]),
                 AttnChunk(
@@ -659,7 +729,7 @@ class TestCalcSelfAttnAreas(TestCase):
                         AttnSlice(
                             slice_id=0,
                             mask_type=AttnMaskType.CAUSAL,
-                            q_range=AttnRange(32, 38),
+                            q_range=AttnRange(33, 38),
                             k_range=AttnRange(43, 48),
                             _area=15,
                         ),
@@ -671,6 +741,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=3,
                         ),
                     ],
+                    sample_ids=[2, 3],
                 ),
                 AttnChunk(
                     chunk_id=5,
@@ -683,6 +754,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=52,
                         ),
                     ],
+                    sample_ids=[3],
                 ),
                 AttnChunk(
                     chunk_id=6,
@@ -695,6 +767,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=116,
                         ),
                     ],
+                    sample_ids=[3],
                 ),
                 AttnChunk(
                     chunk_id=7,
@@ -714,6 +787,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=329,
                         ),
                     ],
+                    sample_ids=[3, 4],
                 ),
                 AttnChunk(
                     chunk_id=8,
@@ -726,6 +800,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=436,
                         ),
                     ],
+                    sample_ids=[4],
                 ),
                 AttnChunk(
                     chunk_id=9,
@@ -738,6 +813,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=500,
                         ),
                     ],
+                    sample_ids=[4],
                 ),
                 AttnChunk(
                     chunk_id=10,
@@ -757,6 +833,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=245,
                         ),
                     ],
+                    sample_ids=[4, 5],
                 ),
                 AttnChunk(
                     chunk_id=11,
@@ -776,6 +853,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=110,
                         ),
                     ],
+                    sample_ids=[5, 6],
                 ),
             ]
         )
@@ -783,7 +861,7 @@ class TestCalcSelfAttnAreas(TestCase):
         assert global_bucket == result_bucket, (
             f"The test in all_causal_1 is not passed!\n"
             f"expect result={result_bucket}\n"
-            f"but get {global_bucket}."
+            f"but got {global_bucket}."
         )
 
     def test_calc_self_attn_areas_all_causal_2(self):
@@ -829,6 +907,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=196,
                         ),
                     ],
+                    sample_ids=[0],
                 ),
                 AttnChunk(
                     chunk_id=1,
@@ -841,6 +920,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=260,
                         ),
                     ],
+                    sample_ids=[0],
                 ),
                 AttnChunk(
                     chunk_id=2,
@@ -853,6 +933,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=324,
                         ),
                     ],
+                    sample_ids=[0],
                 ),
                 AttnChunk(
                     chunk_id=3,
@@ -865,6 +946,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=285,
                         ),
                     ],
+                    sample_ids=[0],
                 ),
                 AttnChunk(chunk_id=4, q_slices=[]),
                 AttnChunk(
@@ -873,11 +955,12 @@ class TestCalcSelfAttnAreas(TestCase):
                         AttnSlice(
                             slice_id=0,
                             mask_type=AttnMaskType.CAUSAL,
-                            q_range=AttnRange(40, 48),
+                            q_range=AttnRange(43, 48),
                             k_range=AttnRange(61, 66),
                             _area=15,
                         ),
                     ],
+                    sample_ids=[1],
                 ),
                 AttnChunk(
                     chunk_id=6,
@@ -890,6 +973,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=40,
                         ),
                     ],
+                    sample_ids=[1],
                 ),
                 AttnChunk(
                     chunk_id=7,
@@ -897,11 +981,12 @@ class TestCalcSelfAttnAreas(TestCase):
                         AttnSlice(
                             slice_id=0,
                             mask_type=AttnMaskType.CAUSAL,
-                            q_range=AttnRange(56, 64),
+                            q_range=AttnRange(61, 64),
                             k_range=AttnRange(34, 37),
                             _area=6,
                         ),
                     ],
+                    sample_ids=[2],
                 ),
                 AttnChunk(
                     chunk_id=8,
@@ -914,6 +999,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=60,
                         ),
                     ],
+                    sample_ids=[2],
                 ),
                 AttnChunk(
                     chunk_id=9,
@@ -933,6 +1019,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=87,
                         ),
                     ],
+                    sample_ids=[2, 3],
                 ),
                 AttnChunk(
                     chunk_id=10,
@@ -945,6 +1032,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=172,
                         ),
                     ],
+                    sample_ids=[3],
                 ),
                 AttnChunk(
                     chunk_id=11,
@@ -957,6 +1045,7 @@ class TestCalcSelfAttnAreas(TestCase):
                             _area=236,
                         ),
                     ],
+                    sample_ids=[3],
                 ),
             ]
         )
@@ -964,7 +1053,7 @@ class TestCalcSelfAttnAreas(TestCase):
         assert global_bucket == result_bucket, (
             f"The testcase of causal_2 is not passed!\n"
             f"expect result={result_bucket}\n"
-            f"but get {global_bucket}."
+            f"but got {global_bucket}."
         )
 
     def test_calc_self_attn_areas_one_line(self):
@@ -1000,11 +1089,12 @@ class TestCalcSelfAttnAreas(TestCase):
                         AttnSlice(
                             slice_id=1,
                             mask_type=AttnMaskType.CAUSAL,
-                            q_range=AttnRange(1, 10),
+                            q_range=AttnRange(9, 10),
                             k_range=AttnRange(0, 1),
                             _area=1,
                         ),
                     ],
+                    sample_ids=[0, 1],
                 ),
             ]
         )
@@ -1012,7 +1102,7 @@ class TestCalcSelfAttnAreas(TestCase):
         assert global_bucket == result_bucket, (
             f"The testcase of one line is not passed!\n"
             f"expect result={result_bucket}\n"
-            f"but get {global_bucket}."
+            f"but got {global_bucket}."
         )
 
     @parameterize(
@@ -1205,6 +1295,8 @@ class TestCalcSelfAttnAreas(TestCase):
         [
             AttnMaskType.FULL,
             AttnMaskType.CAUSAL,
+            AttnMaskType.INVCAUSAL,
+            AttnMaskType.BICAUSAL,
         ],
     )
     @parameterize("chunk_size", [4, 8, 16])
@@ -1235,7 +1327,7 @@ class TestCalcSelfAttnAreas(TestCase):
 
         assert (
             len(global_bucket.q_chunks) == num_chunks
-        ), f"The num of chunks must be {num_chunks}, but get {len(global_bucket.q_chunks)}"
+        ), f"The num of chunks must be {num_chunks}, but got {len(global_bucket.q_chunks)}"
 
         answer = np.zeros((q_ranges.end, q_ranges.end), dtype=np.int32)
         result = np.zeros((q_ranges.end, q_ranges.end), dtype=np.int32)

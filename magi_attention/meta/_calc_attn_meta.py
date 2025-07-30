@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
 from magi_attention.meta.collection.calc_meta import AttnCalcMeta
 from magi_attention.meta.collection.comm_meta import CommMeta
@@ -27,8 +28,8 @@ def calc_attn_meta_from_dispatch_meta(
     dispatch_meta_k: DispatchMeta,
     bucket_per_rank: list[AttnBucket],
     cp_group: dist.ProcessGroup,
-    high_bandwith_domain_size: int,
     overlap_config: OverlapConfig,
+    cp_mesh: DeviceMesh | None = None,
 ) -> tuple[CommMeta, AttnCalcMeta, DistAttnSolver]:
     """Calculate the communication and calculation meta from the dispatch meta
 
@@ -37,8 +38,8 @@ def calc_attn_meta_from_dispatch_meta(
         dispatch_meta_k (DispatchMeta): The dispatch meta for key
         bucket_per_rank (list[AttnBucket]): The bucket per rank
         cp_group (dist.ProcessGroup): The NCCL process group
-        high_bandwith_domain_size (int): The high bandwith domain size
         overlap_config (OverlapConfig): The overlap config, including the overlap mode, overlap degree, overlap chunk size, etc
+        cp_mesh (DeviceMesh): process mesh, only support 1D or 2D mesh for now.
 
     Returns:
         tuple[CommMeta, AttnCalcMeta]: The communication and calculation meta
@@ -49,8 +50,8 @@ def calc_attn_meta_from_dispatch_meta(
         dispatch_meta_q=dispatch_meta_q,
         dispatch_meta_k=dispatch_meta_k,
         cp_group=cp_group,
-        high_bandwith_domain_size=high_bandwith_domain_size,
         overlap_config=overlap_config,
+        cp_mesh=cp_mesh,
     )
 
     comm_meta = attn_solver.calc_comm_meta()
@@ -60,11 +61,5 @@ def calc_attn_meta_from_dispatch_meta(
         "The overlap degree is inconsistent between "
         f"comm meta ({comm_meta.overlap_degree}) and calc meta ({calc_meta.overlap_degree})."
     )
-
-    # DE-BUG: log attn solver, comm meta and calc meta
-    # from magi_attention.utils import write_rank
-    # write_rank(repr(attn_solver), "attn_solver.log")
-    # write_rank(repr(comm_meta), "comm_meta.log")
-    # write_rank(repr(calc_meta), "calc_meta.log")
 
     return comm_meta, calc_meta, attn_solver

@@ -232,7 +232,6 @@ class Benchmark:
         ylabel: str | dict[str, str] = "",
         x_log: bool = False,
         y_log: bool = False,
-        color=None,
         styles=None,
     ):
         """
@@ -335,8 +334,7 @@ class Mark(object):
         save_path: str,
         show_plots: bool,
         print_data: bool,
-        diff_col=False,
-        save_precision=6,
+        print_value_on_bar: bool,
         **kwargs,
     ):
         # run the benchmark functions
@@ -351,20 +349,18 @@ class Mark(object):
                 "axes.titlesize": 14,
                 "axes.labelsize": 12,
                 "legend.fontsize": 10,
-                "xtick.labelsize": 10,
-                "ytick.labelsize": 10,
+                "xtick.labelsize": 15,
+                "ytick.labelsize": 15,
                 "grid.linewidth": 1.2,
             },
         )
-        COLOR_PALETTE = sns.color_palette(
-            "viridis", n_colors=len(bench.line_names)
-        )  # 改用专业渐变色[7,8](@ref)
+        COLOR_PALETTE = sns.color_palette("viridis", n_colors=len(bench.line_names))
 
         if not bench.plot_name:
             return
 
         for k in dfs:
-            plt.figure(figsize=(14, 8), dpi=300)
+            plt.figure(figsize=(14, 8), dpi=100)
             ax = plt.gca()
 
             all_data = []
@@ -377,7 +373,7 @@ class Mark(object):
                 data = dfs[k][provider].dropna().values
                 all_data.append(data)
 
-            # 画柱状图
+            # draw bar plots
             for i, (data, label) in enumerate(zip(all_data, labels)):
                 edge_color = COLOR_PALETTE[i] + (0.7,)
                 ax.bar(
@@ -392,9 +388,9 @@ class Mark(object):
                     zorder=2,
                 )
 
-                # Annotate bars where value is -1 or -2
+                # Annotate bars
                 for idx, value in enumerate(data):
-                    if value == -1:
+                    if value == -1:  # OOM
                         ax.text(
                             x_indices[idx] + i * bar_width,
                             value + 0.2,  # Position text slightly above the bar
@@ -404,10 +400,11 @@ class Mark(object):
                             va="bottom",
                             fontsize=15,
                             fontweight="bold",  # Add this line to make the text bold
-                            color=COLOR_PALETTE[i],
+                            # color=COLOR_PALETTE[i],
+                            color="red",
                             zorder=4,
                         )
-                    elif value == -2:
+                    elif value == -2:  # not supported
                         ax.text(
                             x_indices[idx] + i * bar_width,
                             value + 0.2,
@@ -416,11 +413,24 @@ class Mark(object):
                             va="bottom",
                             fontsize=15,
                             fontweight="bold",  # Add this line to make the text bold
-                            color=COLOR_PALETTE[i],
+                            # color=COLOR_PALETTE[i],
+                            color="red",
+                            zorder=4,
+                        )
+                    elif print_value_on_bar:  # normal value
+                        ax.text(
+                            x_indices[idx] + i * bar_width,
+                            value + 1.0,
+                            f"{value:.2f}",
+                            ha="center",
+                            va="bottom",
+                            fontsize=10,
+                            # color=COLOR_PALETTE[i],
+                            color="black",
                             zorder=4,
                         )
 
-            # 画曲线图
+            # draw line plots
             for i, (data, label) in enumerate(zip(all_data, labels)):
                 # Create a copy of the data to modify
                 plot_data = data.copy().astype(float)
@@ -465,20 +475,20 @@ class Mark(object):
             # set xlabel and ylabel
             ax.set_xlabel(
                 bench.xlabel or x_names[0],
-                fontsize=12,
+                fontsize=15,
                 labelpad=12,
                 fontweight="semibold",
             )
             ax.set_ylabel(
                 bench.ylabel[k] if isinstance(bench.ylabel, dict) else bench.ylabel,
-                fontsize=12,
+                fontsize=15,
                 labelpad=12,
                 fontweight="semibold",
             )
 
             ax.set_title(
                 f"The benchmark of {k}\n{bench.plot_name}",
-                fontsize=15,
+                fontsize=19,
                 pad=18,
                 fontweight="bold",
                 color="#2d3436",
@@ -487,10 +497,10 @@ class Mark(object):
             legend = ax.legend(
                 frameon=True,
                 shadow=True,
-                fontsize=10,
+                fontsize=15,
                 borderpad=1,
                 title=bench.line_arg,
-                title_fontsize="12",
+                title_fontsize="18",
                 loc="upper left",
                 bbox_to_anchor=(1, 1),
             )
@@ -502,14 +512,14 @@ class Mark(object):
             if save_path:
                 plt.savefig(
                     os.path.join(save_path, f"{k}_report.pdf"),
-                    dpi=300,
+                    dpi=100,
                     bbox_inches="tight",
                     transparent=False,
                     facecolor="white",
                 )
                 plt.savefig(
                     os.path.join(save_path, f"{k}_report.png"),
-                    dpi=300,
+                    dpi=100,
                     bbox_inches="tight",
                     transparent=False,
                     facecolor="white",
@@ -518,15 +528,24 @@ class Mark(object):
                 plt.show()
             plt.close()
 
+        if save_path:
+            for name, df in dfs.items():
+                df.to_csv(os.path.join(save_path, f"{name}.csv"), index=False)
+
+        if print_data:
+            for name, df in dfs.items():
+                print(df)
+
         return dfs
 
     def run(
         self,
-        show_plots=False,
-        print_data=False,
-        save_path="",
-        return_df=False,
-        report_all_name="perf_report_all",
+        show_plots: bool = False,
+        print_data: bool = False,
+        print_value_on_bar: bool = False,
+        save_path: str = "",
+        return_df: bool = False,
+        report_all_name: str = "perf_report_all",
         **kwargs,
     ):
         has_single_bench = isinstance(self.benchmarks, Benchmark)
@@ -547,7 +566,14 @@ class Mark(object):
             if bench_save_path:
                 os.makedirs(bench_save_path, exist_ok=True)
 
-            dfs = self._run(bench, bench_save_path, show_plots, print_data, **kwargs)
+            dfs = self._run(
+                bench,
+                bench_save_path,
+                show_plots,
+                print_data,
+                print_value_on_bar,
+                **kwargs,
+            )
             result_dfs.append(dfs)
 
             if bench_save_path:

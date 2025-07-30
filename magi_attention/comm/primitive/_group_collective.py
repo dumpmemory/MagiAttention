@@ -17,9 +17,15 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+import magi_attention
 from magi_attention.comm.work import WorkWithPostProcessFn
 from magi_attention.utils import nvtx
 
+from ._all2all_v import all2all_v
+from ._group_collective_hier import (
+    hier_group_cast_impl_with_a2av,
+    hier_group_reduce_impl_with_a2av,
+)
 from .utils import _calc_group_cast_a2a_args, _calc_group_reduce_a2a_args
 
 __all__ = [
@@ -43,12 +49,18 @@ def group_cast_collective(
 ) -> WorkWithPostProcessFn:
     """
     Args:
-        input: [sum(input_split_size), ...]
-        output: [sum(output_split_size), ...]
-        input_split_size: 0 <= len(input_split_size_list) <= group_size
-        output_split_size: [M]
-        dst_indices: [N, ?]
-        src_indices: [M, ?]
+        input(torch.Tensor): input tensor with shape [input_seqlen,...]
+        output(torch.Tensor): output tensor with shape [output_seqlen,...]
+        input_split_size_list(list[int]): the size list to split the input tensor,
+            where sum(input_split_size_list) == input_seqlen
+        output_split_size_list(list[int]): the size list to split the output tensor,
+            where sum(output_split_size_list) == output_seqlen
+        dst_indices_list(list[list[int]]): the destination indices list for each input split to broadcast to,
+            where len(dst_indices_list) == len(input_split_size_list)
+        src_index_list(list[int]): the source index list for each output split to receive from,
+            where len(src_index_list) == len(output_split_size_list)
+            NOTE: the order of the output splits are "stable", which means the ones from the same source
+            will be in the same order as the input splits
 
         HACK:
         **kwargs: additional keyword arguments,
@@ -59,28 +71,57 @@ def group_cast_collective(
         can be processed in advance, and just passed in through `kwargs` to reduce runtime overhead
 
     Returns:
-        work + with_post_process_fn:
-            work: Work | None
-            post_process_fn: Callable[[torch.Tensor], torch.Tensor]
+        work_with_post_process_fn(WorkWithPostProcessFn): async work with the post-process function
+        to transfer from a2a-v output tensor to group-cast output tensor
+
+    TODO: add examples
 
     NOTE(xiaowu):
-        * 可以通过input_split_size_list把input变成list[splited_input], 其中
-        每一个splited_input都可以发给0个或多个rank, 然后通过dst_indices_list
-        来决定发给哪个rank.
-        * 可以通过output_split_size_list把output变成list[splited_output], 其中
-        每一个splited_output都必须从1个src_rank那里收到, 然后通过src_index_list
-        来决定从哪个rank那里收到.
+        * The input can be split into a list of [splited_input] using input_split_size_list,
+            where each splited_input can be sent to 0 or multiple ranks,
+            and the destination ranks are determined by dst_indices_list.
+        * The output can be split into a list of [splited_output] using output_split_size_list,
+            where each splited_output must be received from exactly 1 src_rank,
+            and the source ranks are determined by src_index_list.
 
     REVIEW(xiaowu):
-        * 是否splited_output必须从1个src_rank那里收到? 能否是0个?
+        * Must each splited_output be received from exactly 1 src_rank? Could it be 0?
     """
 
-    assert len(input_split_size_list) == len(dst_indices_list)
-    assert len(output_split_size_list) == len(src_index_list)
+    assert len(input_split_size_list) == len(dst_indices_list), (
+        f"The length of input_split_size_list and dst_indices_list should be the same, "
+        f"but got {len(input_split_size_list)=} and {len(dst_indices_list)=}"
+    )
+    assert len(output_split_size_list) == len(src_index_list), (
+        f"The length of output_split_size_list and src_index_list should be the same, "
+        f"but got {len(output_split_size_list)=} and {len(src_index_list)=}"
+    )
+    assert input.shape[0] == sum(input_split_size_list), (
+        f"The sum of input_split_size_list should be equal to input_seqlen, "
+        f"but got {sum(input_split_size_list)=} and {input.shape[0]=}"
+    )
+    assert output.shape[0] == sum(output_split_size_list), (
+        f"The sum of output_split_size_list should be equal to output_seqlen, "
+        f"but got {sum(output_split_size_list)=} and {output.shape[0]=}"
+    )
 
-    world_size = dist.get_world_size(group)
+    if magi_attention.comm.is_hierarchical_comm_enable():
+        # NOTE: a workaround to reduce inter-comm overhead by hierarchical group-cast
+        return hier_group_cast_impl_with_a2av(
+            input_tensor=input,
+            output_tensor=output,
+            input_split_size_list=input_split_size_list,
+            output_split_size_list=output_split_size_list,
+            dst_indices_list=dst_indices_list,
+            src_index_list=src_index_list,
+            group=group,
+            async_op=async_op,
+            **kwargs,
+        )
 
     # ---------    calc group cast a2a args     --------- #
+
+    world_size = dist.get_world_size(group)
 
     (
         a2a_output,
@@ -101,17 +142,14 @@ def group_cast_collective(
 
     # ---------    lauch a2a comm kernel     --------- #
 
-    with nvtx.add_nvtx_event(
-        f"{a2a_output_split_size=} | {a2a_input_split_size=} | {a2a_output.shape=} | {a2a_input.shape=}"
-    ):
-        work = dist.all_to_all_single(
-            output=a2a_output,
-            input=a2a_input,
-            output_split_sizes=a2a_output_split_size,
-            input_split_sizes=a2a_input_split_size,
-            group=group,
-            async_op=True,
-        )
+    work = all2all_v(
+        input=a2a_input,
+        output=a2a_output,
+        input_split_size_list=a2a_input_split_size,
+        output_split_size_list=a2a_output_split_size,
+        group=group,
+        async_op=async_op,
+    )
 
     return WorkWithPostProcessFn(
         work=work,
@@ -136,12 +174,18 @@ def group_reduce_collective(
     """
 
     Args:
-        input: [sum(input_split_size),...]
-        output: [sum(output_split_size),...]
-        input_split_size: 0 <= len(input_split_size_list) <= group_size
-        output_split_size: [M]
-        dst_index: [N,?]
-        src_indices: [M,?]
+        input(torch.Tensor): input tensor with shape [input_seqlen,...]
+        output(torch.Tensor): output tensor with shape [output_seqlen,...]
+        input_split_size_list(list[int]): the size list to split the input tensor,
+            where sum(input_split_size_list) == input_seqlen
+        output_split_size_list(list[int]): the size list to split the output tensor,
+            where sum(output_split_size_list) == output_seqlen
+        dst_index_list(list[int]): the destination index list for each input split to return to,
+            where len(dst_index_list) == len(input_split_size_list)
+        src_indices_list(list[list[int]]): the source indices list for each output split to reduce from,
+            where len(src_indices_list) == len(output_split_size_list)
+            NOTE: since any reduce operation satisfies the commutative property, the order of the input splits to reduce
+            to the same output split does not matter
 
         HACK:
         **kwargs: additional keyword arguments,
@@ -152,24 +196,51 @@ def group_reduce_collective(
         can be processed in advance, and just passed in through `kwargs` to reduce runtime overhead
 
     Returns:
-        work + with_post_process_fn:
-            work: Work | None
-            post_process_fn: Callable[[torch.Tensor], torch.Tensor]
-
+        work_with_post_process_fn(WorkWithPostProcessFn): async work with the post-process function
+        to transfer from a2a-v output tensor to group-reduce output tensor
 
     NOTE(xiaowu):
-        * 可以通过input_split_size_list把input变成list[splited_input], 其中
-        每一个splited_input都必须发给一个rank, 然后通过dst_index_list来决定发给哪个rank.
-        * 可以通过output_split_size_list把output变成list[splited_output], 其中
-        每一个splited_output都可以从0个或多个src_rank那里reduce得到, 然后通过src_indices_list
-        来决定从哪个rank那里reduce得到.
+        * The input can be split into a list of [splited_input] using input_split_size_list,
+            where each splited_input must be sent to one rank,
+            and the destination rank is determined by dst_index_list.
+        * The output can be split into a list of [splited_output] using output_split_size_list,
+            where each splited_output can be reduced from 0 or multiple src_ranks,
+            and the source ranks for reduction are determined by src_indices_list.
     """
-    assert len(input_split_size_list) == len(dst_index_list)
-    assert len(output_split_size_list) == len(src_indices_list)
+    assert len(input_split_size_list) == len(dst_index_list), (
+        f"input_split_size_list and dst_index_list should have the same length, "
+        f"but got {len(input_split_size_list)=} and {len(dst_index_list)=}"
+    )
+    assert len(output_split_size_list) == len(src_indices_list), (
+        f"output_split_size_list and src_indices_list should have the same length, "
+        f"but got {len(output_split_size_list)=} and {len(src_indices_list)=}"
+    )
+    assert input.shape[0] == sum(input_split_size_list), (
+        f"The sum of input_split_size_list should be equal to input_seqlen, "
+        f"but got {sum(input_split_size_list)=} and {input.shape[0]=}"
+    )
+    assert output.shape[0] == sum(output_split_size_list), (
+        f"The sum of output_split_size_list should be equal to output_seqlen, "
+        f"but got {sum(output_split_size_list)=} and {output.shape[0]=}"
+    )
 
-    world_size = dist.get_world_size(group)
+    if magi_attention.comm.is_hierarchical_comm_enable():
+        # NOTE: a workaround to reduce inter-comm overhead by hierarchical group-reduce
+        return hier_group_reduce_impl_with_a2av(
+            input_tensor=input,
+            output_tensor=output,
+            input_split_size_list=input_split_size_list,
+            output_split_size_list=output_split_size_list,
+            dst_index_list=dst_index_list,
+            src_indices_list=src_indices_list,
+            group=group,
+            async_op=async_op,
+            **kwargs,
+        )
 
     # ---------    calc group reduce a2a args     --------- #
+
+    world_size = dist.get_world_size(group)
 
     (
         a2a_output,
@@ -190,13 +261,13 @@ def group_reduce_collective(
 
     # ---------    lauch a2a comm kernel     --------- #
 
-    work = dist.all_to_all_single(
-        output=a2a_output,
+    work = all2all_v(
         input=a2a_input,
-        output_split_sizes=a2a_output_split_size,
-        input_split_sizes=a2a_input_split_size,
+        output=a2a_output,
+        input_split_size_list=a2a_input_split_size,
+        output_split_size_list=a2a_output_split_size,
         group=group,
-        async_op=True,
+        async_op=async_op,
     )
 
     return WorkWithPostProcessFn(

@@ -17,11 +17,15 @@ from magi_attention.common.enum import AttnMaskType, AttnRole, AttnType
 from magi_attention.meta.collection import DispatchMeta
 from magi_attention.meta.container import AttnBucket, AttnChunk, AttnSlice
 from magi_attention.meta.solver.dispatch_solver import (
+    BatchToppHeapDispatchAlg,
     DispatchConfig,
+    DispatchData,
     DispatchJob,
     DispatchSolution,
     DispatchSolver,
     IOUAffinity,
+    SampleIDAffinity,
+    SortedSequentialSelectAlg,
     ToppHeapDispatchAlg,
 )
 from magi_attention.utils import (
@@ -30,12 +34,10 @@ from magi_attention.utils import (
     perm_idxs2unperm_idxs,
     wrap_to_list,
 )
-from magi_attention.utils._utils import argsort, is_list_value_all
+from magi_attention.utils._utils import argsort
 
 __all__ = [
     "calc_dispatch_meta_from_qk_ranges",
-    "seqlens2cu_seqlens",
-    "cu_seqlens2seqlens",
 ]
 
 
@@ -53,7 +55,6 @@ def calc_dispatch_meta_from_qk_ranges(
     is_same_source: bool,
     is_q_permutable: bool,
     is_k_permutable: bool,
-    high_bandwith_domain_size: int,
 ) -> tuple[DispatchMeta, DispatchMeta, list[AttnBucket]]:
     """Calculate dispatch meta from query and key ranges
 
@@ -85,8 +86,6 @@ def calc_dispatch_meta_from_qk_ranges(
                 3. for multi-modal transformer with external encoders, it applies 'cross-attn' as follows:
                     a) is_same_source is False
                     b) q is unpermutable cuz of self-attn, but k is permutable even in a different way
-
-        high_bandwith_domain_size (int): The high bandwith domain size
 
     Returns:
         tuple[DispatchMeta, DispatchMeta]: dispatch_meta_q and dispatch_meta_k
@@ -163,7 +162,6 @@ def calc_dispatch_meta_from_qk_ranges(
                 chunk_size=chunk_size,
                 cp_size=cp_size,
                 cp_rank=cp_rank,
-                high_bandwith_domain_size=high_bandwith_domain_size,
                 dispatch_config=dispatch_config,
             )
         case True, False, True | True, True, False:
@@ -208,7 +206,6 @@ def _calc_self_attn_dispatch_meta_from_qk_ranges(
     chunk_size: int,
     cp_size: int,
     cp_rank: int,
-    high_bandwith_domain_size: int,
     dispatch_config: DispatchConfig,
 ) -> tuple[DispatchMeta, DispatchMeta, list[AttnBucket]]:
     """Calculate dispatch meta from query and key ranges for self-attn settings
@@ -231,8 +228,6 @@ def _calc_self_attn_dispatch_meta_from_qk_ranges(
         cp_size (int): context-parallel world size
         cp_rank (int): context-parallel local rank, ranging in [0,  cp_size)
 
-        high_bandwith_domain_size (int): The high bandwith domain size
-
         dispatch_config (DispatchConfig): dispatch config
 
     Returns:
@@ -248,14 +243,6 @@ def _calc_self_attn_dispatch_meta_from_qk_ranges(
         f"as well as {num_chunks_q=} and {num_chunks_k=}"
     )
 
-    assert (
-        is_list_value_all(attn_mask_type, AttnMaskType.FULL)
-        or q_ranges.is_non_overlap()
-    ), (
-        "Only support q_range overlap when masktype is all full, "
-        "but get other masktype when q_range is overlap"
-    )
-
     # --------------    extract some trivial meta info   -------------- #
 
     total_seqlen = total_seqlen_q
@@ -265,8 +252,8 @@ def _calc_self_attn_dispatch_meta_from_qk_ranges(
 
     # sort (q_range, k_range, masktype) with (q_range.start, q_range.end)
     sorted_indices = argsort(q_ranges, key=lambda x: (x.start, x.end))
-    q_ranges._ranges = [q_ranges[i] for i in sorted_indices]
-    k_ranges._ranges = [k_ranges[i] for i in sorted_indices]
+    q_ranges = AttnRanges.from_ranges([q_ranges[i] for i in sorted_indices])
+    k_ranges = AttnRanges.from_ranges([k_ranges[i] for i in sorted_indices])
     attn_mask_type = [attn_mask_type[i] for i in sorted_indices]
 
     # -------    calculate attn areas to construct an undispatch bucket   ------- #
@@ -284,17 +271,33 @@ def _calc_self_attn_dispatch_meta_from_qk_ranges(
 
     dispatch_solver = DispatchSolver(alg=dispatch_config.alg)
     affinities = None
-    if isinstance(dispatch_config.alg, ToppHeapDispatchAlg):
+    sample_areas = None
+    if isinstance(dispatch_config.alg, (ToppHeapDispatchAlg, BatchToppHeapDispatchAlg)):
         affinities = [
             IOUAffinity.from_ranges(chunk.k_ranges) for chunk in global_bucket.q_chunks
         ]
+    elif isinstance(dispatch_config.alg, SortedSequentialSelectAlg):
+        affinities = [
+            SampleIDAffinity.from_list(chunk.sample_ids)  # type: ignore
+            for chunk in global_bucket.q_chunks
+        ]
+
+        sample_slices = [
+            AttnSlice(q_range=q_range, k_range=k_range, mask_type=mask_type)
+            for q_range, k_range, mask_type in zip(q_ranges, k_ranges, attn_mask_type)
+        ]
+        sample_areas = [sample_slice.area for sample_slice in sample_slices]
     dispatch_jobs = DispatchJob.from_job_list(
         workloads=attn_areas,  # type: ignore[arg-type]
         affinities=affinities,  # type: ignore[arg-type]
     )
-    dispatch_solution: DispatchSolution = dispatch_solver.solve(
+    dispatch_data: DispatchData = DispatchData(
         jobs=dispatch_jobs,
         num_buckets=cp_size,
+        sample_areas=sample_areas,  # type: ignore[arg-type]
+    )
+    dispatch_solution: DispatchSolution = dispatch_solver.solve(
+        dispatch_data=dispatch_data,
     )
     partitions = dispatch_solution.bucket_partitions
 
@@ -332,7 +335,6 @@ def _calc_self_attn_dispatch_meta_from_qk_ranges(
         partitions_unperm_idxs=partitions_unperm_idxs,
         global_bucket=global_bucket,
         buckets_per_rank=buckets_per_rank,
-        high_bandwith_domain_size=high_bandwith_domain_size,
     )
 
     meta_q = DispatchMeta(
@@ -398,8 +400,6 @@ def _calc_self_attn_areas(
         # Iterate from the current range until the start of the range exceeds the current chunk.
         while cur_range_idx < n and q_ranges[cur_range_idx].start < chunk_end:
             mask_type = attn_mask_type[cur_range_idx]
-            is_causal = mask_type == AttnMaskType.CAUSAL
-
             slice: AttnSlice = AttnSlice(slice_id=slice_id, mask_type=mask_type)
 
             attn_len = k_ranges[cur_range_idx].seqlen
@@ -425,7 +425,7 @@ def _calc_self_attn_areas(
                 None,
             )
 
-            if is_causal:
+            if mask_type == AttnMaskType.CAUSAL:
                 q_range_start = max(attn_q_start, chunk_begin, attn_q_end - attn_len)
                 q_range_end = min(attn_q_end, chunk_end)
                 if q_range_start < q_range_end:
@@ -444,20 +444,66 @@ def _calc_self_attn_areas(
                         * height_of_causal
                         // 2
                     )
-                    # HACK To ensure the correctness of some test cases,
-                    # a special handling is temporarily implemented here, which can be removed later.
-                    q_range_start = max(attn_q_start, chunk_begin)
                 else:
                     # empty slice
                     (q_range_start, q_range_end) = (q_range_start, q_range_start)
                     (k_range_start, k_range_end) = (attn_k_start, attn_k_start)
                     slice.area = 0
-            else:
+            elif mask_type == AttnMaskType.INVCAUSAL:
+                q_range_start = max(attn_q_start, chunk_begin)
+                q_range_end = min(attn_q_end, chunk_end, attn_q_start + attn_len)
+                if q_range_start < q_range_end:
+                    # the area of a triangle or a trapezoid
+                    diff_slice_start_and_q_start = q_range_start - attn_q_start
+                    (k_range_start, k_range_end) = (
+                        attn_k_start + diff_slice_start_and_q_start,
+                        attn_k_end,
+                    )
+
+                    # calculate the base and height of the trapezoid
+                    base_of_causal = k_range_end - k_range_start
+                    height_of_causal = q_range_end - q_range_start
+                    slice.area = (
+                        (2 * base_of_causal - height_of_causal + 1)
+                        * height_of_causal
+                        // 2
+                    )
+                else:
+                    # empty slice
+                    (q_range_start, q_range_end) = (q_range_start, q_range_start)
+                    (k_range_start, k_range_end) = (attn_k_start, attn_k_start)
+                    slice.area = 0
+            elif mask_type == AttnMaskType.BICAUSAL:
+                q_range_start = max(attn_q_start, chunk_begin)
+                q_range_end = min(attn_q_end, chunk_end)
+
+                diff_slice_start_and_q_start = q_range_start - attn_q_start
+                diff_slice_end_and_q_end = attn_q_end - q_range_end
+
+                base_of_parallelogram = attn_len - q_ranges[cur_range_idx].seqlen + 1
+                height_of_parallelogram = q_range_end - q_range_start
+
+                if base_of_parallelogram > 0:
+                    # the area of a parallelogram
+                    slice.area = base_of_parallelogram * height_of_parallelogram
+                    k_range_start = attn_k_start + diff_slice_start_and_q_start
+                    k_range_end = attn_k_end - diff_slice_end_and_q_end
+                else:
+                    # empty slice
+                    (q_range_start, q_range_end) = (q_range_start, q_range_start)
+                    (k_range_start, k_range_end) = (attn_k_start, attn_k_start)
+                    slice.area = 0
+            elif mask_type == AttnMaskType.FULL:
                 # the area of a rectangle
                 q_range_start = max(attn_q_start, chunk_begin)
                 q_range_end = min(attn_q_end, chunk_end)
                 (k_range_start, k_range_end) = (attn_k_start, attn_k_end)
                 slice.area = (q_range_end - q_range_start) * attn_len
+            else:
+                raise ValueError(
+                    f"Only support 'FULL', 'CAUSAL', 'BICAUSAL', 'INVCAUSAL', "
+                    f"but got {mask_type=}"
+                )
             cur_range_idx += 1
 
             # set q_range, k_range for this slice
@@ -467,22 +513,9 @@ def _calc_self_attn_areas(
             if slice.k_range.seqlen > 0 and slice.area > 0:
                 # append this q slice to the current chunk except invalid slice
                 chunk.q_slices.append(slice)
+                chunk.sample_ids.append(cur_range_idx - 1)
                 slice_id += 1
 
         global_bucket.q_chunks.append(chunk)
 
     return global_bucket
-
-
-def seqlens2cu_seqlens(seqlens: list[int]) -> list[int]:
-    cu_seqlens = [0]
-    for seqlen in seqlens:
-        cu_seqlens.append(cu_seqlens[-1] + seqlen)
-    return cu_seqlens
-
-
-def cu_seqlens2seqlens(cu_seqlens: list[int]) -> list[int]:
-    seqlens = []
-    for i in range(1, len(cu_seqlens)):
-        seqlens.append(cu_seqlens[i] - cu_seqlens[i - 1])
-    return seqlens

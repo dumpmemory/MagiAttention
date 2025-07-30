@@ -12,12 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from magi_attention.common.enum import AttnMaskType, AttnOverlapMode
+from magi_attention.common.ranges import AttnRanges
+from magi_attention.config import DistAttnConfig
 from magi_attention.functional import flex_flash_attn_func
+from magi_attention.meta.solver.dispatch_solver import (
+    DispatchConfig,
+    MinHeapDispatchAlg,
+    SequentialDispatchAlg,
+    SortedSequentialSelectAlg,
+    ToppHeapDispatchAlg,
+)
+from magi_attention.meta.solver.overlap_solver import OverlapConfig, UniformOverlapAlg
 
 from .functools import (
     compute_pad_size,
     from_mask,
     full_attention_to_varlen_attention,
+    init_hierarchical_mesh,
     squash_batch_dim,
 )
 from .magi_attn_interface import (
@@ -47,4 +59,18 @@ __all__ = [
     "squash_batch_dim",
     "full_attention_to_varlen_attention",
     "from_mask",
+    "AttnMaskType",
+    "AttnOverlapMode",
+    "AttnRanges",
+    "DistAttnConfig",
+    "DispatchConfig",
+    "MinHeapDispatchAlg",
+    "OverlapConfig",
+    "UniformOverlapAlg",
+    "init_hierarchical_mesh",
+    "infer_attn_mask_from_window_size",
+    "infer_attn_mask_from_sliding_window",
+    "SequentialDispatchAlg",
+    "SortedSequentialSelectAlg",
+    "ToppHeapDispatchAlg",
 ]

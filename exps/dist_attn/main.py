@@ -169,13 +169,10 @@ if __name__ == "__main__":
             random_seed=42,
         ),
     )
-    hb_domain_size = 1
 
     dist_attn_config = DistAttnConfig(
         dispatch_config=dispatch_config,
         overlap_config=overlap_config,
-        high_bandwith_domain_size=hb_domain_size,
-        deterministic=False,
     )
 
     # magi_attention mgr
@@ -192,7 +189,7 @@ if __name__ == "__main__":
         is_k_permutable=True,
         dist_attn_config=dist_attn_config,
     )
-    # HACK: double cp group for kv/dkv
+    # HACK: seperate cp group for dkv group-reduce
     dist_attn_runtime_mgr.dist_attn_runtime.cp_group_dkv = nccl_groups[1]
 
     # -------------------       run   ------------------- #

@@ -16,33 +16,67 @@ from collections import defaultdict
 from functools import partial
 from itertools import accumulate, chain, pairwise
 from logging import getLogger
-from typing import Callable, TypeAlias
+from typing import Any, Callable, TypeAlias
 
 import torch
 import torch.distributed as dist
 
+import magi_attention
+from magi_attention.comm.work import WorkWithPostProcessFn
 from magi_attention.common.range import NaiveRange
 from magi_attention.common.range_op import range_gather, range_reduce
+from magi_attention.common.range_op.utils import (
+    _calc_cu_range_sizes,
+    _calc_out2inp_range_map,
+    _calc_ranges_row_map,
+)
 from magi_attention.common.ranges import NaiveRanges
 from magi_attention.utils import nvtx
 
 logger = getLogger("magi_attention")
 
-__all__ = [
-    "_calc_group_cast_a2a_args",
-    "_calc_group_reduce_a2a_args",
-    "_calc_group_cast_a2a_input_meta_args",
-    "_calc_group_cast_a2a_output_meta_args",
-    "_calc_group_reduce_a2a_input_meta_args",
-    "_calc_group_reduce_a2a_output_meta_args",
-    "_trans_with_dim0",
-    "_get_dims_as_trans_with_dim0",
-]
+
+def get_pg_backend(pg: dist.ProcessGroup, device: str = "cuda") -> dist.Backend:
+    return pg._get_backend(torch.device(device))
+
+
+def _sanity_check_nccl_send_recv(
+    num_send_list: list[int], num_recv_list: list[int], world_size: int
+):
+    if num_send_list != num_recv_list:
+        num_diff_idxs: list[int] = torch.nonzero(
+            torch.tensor(num_send_list) - torch.tensor(num_recv_list), as_tuple=True
+        )[0].tolist()
+
+        msg = [
+            (
+                "For each pair of src_rank and dst_rank, "
+                "The number of nccl send calls launched by src_rank for dst_rank "
+                "should be identical to the number of nccl recv calls launched by dst_rank for src_rank, "
+                "but got: "
+            )
+        ]
+        for idx in num_diff_idxs:
+            src_rank, dst_rank = divmod(idx, world_size)
+            msg.append(
+                f"The number of send calls launched by rank{src_rank} for rank{dst_rank} is {num_send_list[idx]} "
+                f"while the number of recv calls launched by rank{dst_rank} for rank{src_rank} is {num_recv_list[idx]}."
+            )
+
+        raise AssertionError("\n".join(msg))
 
 
 def _seqlens2curanges(
     seqlens: list[int],
 ) -> NaiveRanges:
+    """Make seqlens to cumulative ranges
+
+    Args:
+        seqlens (list[int]): the seqlen list, e.g. [4, 2, 7]
+
+    Returns:
+        NaiveRanges: the cumulative ranges, e.g. [(0, 4), (4, 6), (6, 13)]
+    """
     return list(pairwise(accumulate([0] + seqlens)))
 
 
@@ -62,30 +96,253 @@ def _calc_range_gather_kwargs_from_ranges_with_rank(
     # calculate the output size
     total_size = sum(range_sizes)
 
-    # calculate cu_range_sizes
-    cu_range_sizes = torch.cumsum(
-        torch.tensor(
-            [0] + range_sizes,
-            dtype=torch.int32,
-        ),
+    # calculate row_map from row idx to range idx
+    range_sizes = torch.tensor([0] + range_sizes, dtype=torch.int32, device=device)
+    row_map = torch.repeat_interleave(
+        torch.arange(0, len(ranges), device=device),
+        range_sizes[1:],
         dim=0,
+        output_size=total_size,
     )
 
-    # convert to tensor
-    ranges = torch.tensor(
-        ranges,
-    )
+    # calculate cu_range_sizes
+    cu_range_sizes = torch.cumsum(range_sizes, dim=0)
 
-    perm_range_gather_kwargs = {
-        "ranges": ranges.to(device),
-        "cu_range_sizes": cu_range_sizes.to(device),
+    range_gather_kwargs = {
+        "ranges": torch.tensor(ranges, device=device),
+        "cu_range_sizes": cu_range_sizes,
+        "row_map": row_map,
         "total_size": total_size,
     }
 
-    return perm_range_gather_kwargs
+    return range_gather_kwargs
+
+
+def _calc_unperm_range_gather_kwargs_from_split_size_list(
+    split_size_list: list[int],
+    unpermute_index_list: list[int],
+    device: torch.device,
+) -> dict:
+    # calculate the output size
+    total_size = sum(split_size_list)
+
+    # calculate each range's start and end
+    ranges = _seqlens2curanges(split_size_list)
+
+    # re-order ranges to be in the order of the output tensor
+    ranges = [ranges[i] for i in unpermute_index_list]
+
+    # calculate range sizes
+    range_sizes = [end - start for start, end in ranges]
+    range_sizes = torch.tensor(
+        [0] + range_sizes,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    # calculate cu_range_sizes
+    cu_range_sizes = torch.cumsum(range_sizes, dim=0)
+
+    # calculate row_map from row idx to range idx
+    row_map = torch.repeat_interleave(
+        torch.arange(0, len(ranges), device=device),
+        range_sizes[1:],
+        dim=0,
+        output_size=total_size,
+    )
+
+    ranges = torch.tensor(ranges, device=device)
+
+    unperm_range_gather_kwargs = {
+        "ranges": ranges,
+        "cu_range_sizes": cu_range_sizes,
+        "row_map": row_map,
+        "total_size": total_size,
+    }
+
+    return unperm_range_gather_kwargs
+
+
+def _calc_range_reduce_kwargs_from_ranges(
+    cu_ranges: NaiveRanges,
+    reduce_ranges_list: list[NaiveRanges],
+    device: torch.device,
+    deterministic: bool = False,
+) -> dict:
+    input_ranges = []
+    output_ranges = []
+    range_sizes = []
+    total_size = 0
+    for (out_start, out_end), reduce_ranges in zip(cu_ranges, reduce_ranges_list):
+        for reduce_start, reduce_end in reduce_ranges:
+            input_ranges.append([reduce_start, reduce_end])
+            output_ranges.append([out_start, out_end])
+            range_sizes.append(reduce_end - reduce_start)
+            total_size += reduce_end - reduce_start
+
+    range_reduce_kwargs: dict[str, Any] = {"deterministic": deterministic}
+    input_ranges = torch.tensor(input_ranges, dtype=torch.int32, device=device)
+    range_reduce_kwargs["input_ranges"] = input_ranges
+
+    if deterministic:
+        (out2inp_range_map, unique_ordered_out_ranges, _) = _calc_out2inp_range_map(
+            output_ranges,
+            # first put to cpu to avoid d2h in `_calc_cu_range_sizes` below
+            device=torch.device("cpu"),
+        )
+
+        cu_range_sizes, total_size = _calc_cu_range_sizes(
+            unique_ordered_out_ranges,
+            device=device,
+        )
+
+        # put back to device before `_calc_ranges_row_map`
+        # to make row_map a device tensor
+        out2inp_range_map = out2inp_range_map.to(device)
+        unique_ordered_out_ranges = unique_ordered_out_ranges.to(device)
+
+        row_map = _calc_ranges_row_map(
+            unique_ordered_out_ranges,
+            total_size,
+        )
+
+        range_reduce_kwargs["out2inp_range_map"] = out2inp_range_map
+        range_reduce_kwargs["unique_ordered_out_ranges"] = unique_ordered_out_ranges
+    else:
+        range_sizes = torch.tensor([0] + range_sizes, dtype=torch.int32, device=device)
+        cu_range_sizes = torch.cumsum(range_sizes, dim=0)
+        row_map = torch.repeat_interleave(
+            torch.arange(0, input_ranges.shape[0], device=device),
+            range_sizes[1:],
+            dim=0,
+            output_size=total_size,
+        )
+
+    range_reduce_kwargs["cu_range_sizes"] = cu_range_sizes
+    range_reduce_kwargs["total_size"] = total_size
+    range_reduce_kwargs["row_map"] = row_map
+
+    output_ranges = torch.tensor(output_ranges, dtype=torch.int32, device=device)
+    range_reduce_kwargs["output_ranges"] = output_ranges
+
+    return range_reduce_kwargs
 
 
 # ------------------        utils for group cast collective       ------------------ #
+
+
+def _group_cast_impl_with_batch_p2p(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    input_split_size_list: list[int],
+    output_split_size_list: list[int],
+    dst_indices_list: list[list[int]],
+    src_index_list: list[int],
+    group: dist.Backend = None,
+    async_op: bool = False,
+    **kwargs,
+):
+    input_list = input.split(input_split_size_list, dim=0)
+    output_list = output.split(output_split_size_list, dim=0)
+
+    p2p_op_list = []
+
+    # send
+    for input_split_idx in range(len(input_split_size_list)):
+        for dst_rank in dst_indices_list[input_split_idx]:
+            p2p_op_list.append(
+                dist.P2POp(
+                    op=dist.isend,
+                    tensor=input_list[input_split_idx],
+                    peer=dst_rank,
+                    group=group,
+                )
+            )
+    # recv
+    for output_split_idx in range(len(output_split_size_list)):
+        src_rank = src_index_list[output_split_idx]
+        p2p_op_list.append(
+            dist.P2POp(
+                op=dist.irecv,
+                tensor=output_list[output_split_idx],
+                peer=src_rank,
+                group=group,
+            )
+        )
+
+    work_list = dist.batch_isend_irecv(p2p_op_list)
+
+    return WorkWithPostProcessFn(
+        work=work_list,
+        post_process_fn=lambda x: x,
+        sync=not async_op,
+    )
+
+
+def sanity_check_for_group_cast_meta_args_per_rank(
+    input_split_size_list_per_rank: list[list[int]],
+    output_split_size_list_per_rank: list[list[int]],
+    dst_indices_list_per_rank: list[list[list[int]]],
+    src_index_list_per_rank: list[list[int]],
+    world_size: int,
+    check_nccl_send_recv: bool = False,
+) -> None:
+    for rank in range(world_size):
+        # sanity check for shape
+        input_split_size_list = input_split_size_list_per_rank[rank]
+        output_split_size_list = output_split_size_list_per_rank[rank]
+        dst_indices_list = dst_indices_list_per_rank[rank]
+        src_index_list = src_index_list_per_rank[rank]
+        assert len(input_split_size_list) == len(dst_indices_list), (
+            f"input_split_size_list and dst_indices_list should have the same length, "
+            f"but got {len(input_split_size_list)=} and {len(dst_indices_list)=}"
+        )
+        assert len(output_split_size_list) == len(src_index_list), (
+            f"output_split_size_list and src_index_list should have the same length, "
+            f"but got {len(output_split_size_list)=} and {len(src_index_list)=}"
+        )
+
+        # sanity check for rank value
+        assert all(
+            0 <= dst_rank < world_size for dst_rank in chain(*dst_indices_list)
+        ), (
+            f"dst_indices_list should contain ranks in [0, {world_size - 1}], "
+            f"but got {dst_indices_list=}"
+        )
+        assert all(0 <= src_rank < world_size for src_rank in src_index_list), (
+            f"src_index_list should contain ranks in [0, {world_size - 1}], "
+            f"but got {src_index_list=}"
+        )
+
+    # sanity check for dst rank order and unique
+    for dst_indices in dst_indices_list:
+        assert dst_indices == sorted(
+            list(set(dst_indices))
+        ), f"dst_indices should be sorted and unique, but got {dst_indices_list=}"
+
+    # sanity check for nccl send/recv consistent number of calls
+    if check_nccl_send_recv:
+        # num_send[src_rank*world_size + dst_rank]: the number of nccl send calls launched by src_rank for dst_rank
+        num_send_list: list[int] = [0] * world_size**2
+        # num_recv[src_rank*world_size + dst_rank]: the number of nccl recv calls launched by dst_rank for src_rank
+        num_recv_list: list[int] = [0] * world_size**2
+
+        for rank in range(world_size):
+            src_rank = rank
+            dst_indices_list = dst_indices_list_per_rank[src_rank]
+            for dst_rank in chain(*dst_indices_list):
+                num_send_list[src_rank * world_size + dst_rank] += 1
+
+            dst_rank = rank
+            src_index_list = src_index_list_per_rank[dst_rank]
+            for src_rank in src_index_list:
+                num_recv_list[src_rank * world_size + dst_rank] += 1
+
+        _sanity_check_nccl_send_recv(
+            num_send_list=num_send_list,
+            num_recv_list=num_recv_list,
+            world_size=world_size,
+        )
 
 
 @nvtx.instrument_nvtx
@@ -166,7 +423,7 @@ def _calc_group_cast_a2a_input_args(
             device=input.device,
         )
 
-    # -----     group_cast_a2a_input tensor sargs     ----- #
+    # -----     group_cast_a2a_input tensor args     ----- #
 
     a2a_input = range_gather(
         input=input,
@@ -182,7 +439,10 @@ def _calc_group_cast_a2a_output_meta_args(
     src_index_list: list[int],
     world_size: int,
     device: torch.device,
-) -> tuple[list[int], dict]:
+    reorder_list: list[int] | None = None,
+    calc_unperm_after_a2a_kwargs: bool = True,
+    return_verbose: bool = False,
+):
     a2a_output_split_size_per_rank: list[list[int]] = [[] for _ in range(world_size)]
     a2a_output_permute_index_list_per_rank: list[list[int]] = [
         [] for _ in range(world_size)
@@ -190,6 +450,19 @@ def _calc_group_cast_a2a_output_meta_args(
     for i, src_index in enumerate(src_index_list):
         a2a_output_split_size_per_rank[src_index].append(output_split_size_list[i])
         a2a_output_permute_index_list_per_rank[src_index].append(i)
+
+    if reorder_list is not None:
+        if magi_attention.is_sanity_check_enable():
+            assert sorted(reorder_list) == list(range(world_size)), (
+                "The reorder list must be a permutation of [0, 1, ..., world_size-1] if not None, "
+                f"but got {reorder_list=} when {world_size=}"
+            )
+        a2a_output_split_size_per_rank = [
+            a2a_output_split_size_per_rank[i] for i in reorder_list
+        ]
+        a2a_output_permute_index_list_per_rank = [
+            a2a_output_permute_index_list_per_rank[i] for i in reorder_list
+        ]
 
     a2a_output_split_size = [sum(x) for x in a2a_output_split_size_per_rank]
     a2a_output_tensor_size_list = list(chain(*a2a_output_split_size_per_rank))
@@ -199,46 +472,27 @@ def _calc_group_cast_a2a_output_meta_args(
         key=lambda x: a2a_output_permute_index_list[x],
     )
 
-    # ---------    calc unperm before a2a kwargs     --------- #
-    # calculate the output size from a2a_output_split_size_list
-    total_size = sum(a2a_output_tensor_size_list)
+    # ---------    calc unperm after a2a kwargs     --------- #
+    if calc_unperm_after_a2a_kwargs:
+        unperm_range_gather_kwargs = (
+            _calc_unperm_range_gather_kwargs_from_split_size_list(
+                split_size_list=a2a_output_tensor_size_list,
+                unpermute_index_list=a2a_output_unpermute_index_list,
+                device=device,
+            )
+        )
+    else:
+        unperm_range_gather_kwargs = {}
 
-    # calculate each range's start and end
-    ranges = torch.tensor(
-        [0] + a2a_output_tensor_size_list,
-        dtype=torch.int32,
-    )
-    ranges = torch.cumsum(ranges, dim=0)
-    ranges = torch.cat(
-        [ranges[0:-1, None], ranges[1:, None]],
-        dim=1,
-    )
-
-    # re-order ranges by a2a_output_unpermute_index_list
-    # this means the ranges are in the order of the output tensor
-    # convert to list for easy indexing
-    ranges = ranges.tolist()
-    ranges = [ranges[i] for i in a2a_output_unpermute_index_list]
-
-    # calculate cu_range_sizes
-    cu_range_sizes = torch.cumsum(
-        torch.tensor(
-            [0] + [end - start for start, end in ranges],
-            dtype=torch.int32,
-        ),
-        dim=0,
-    )
-
-    # convert to tensor again
-    ranges = torch.tensor(
-        ranges,
-    )
-
-    unperm_range_gather_kwargs = {
-        "ranges": ranges.to(device),
-        "cu_range_sizes": cu_range_sizes.to(device),
-        "total_size": total_size,
-    }
+    if return_verbose:
+        return (
+            a2a_output_split_size,
+            unperm_range_gather_kwargs,
+            # verbose
+            a2a_output_tensor_size_list,
+            a2a_output_permute_index_list,
+            a2a_output_unpermute_index_list,
+        )
 
     return (
         a2a_output_split_size,
@@ -269,7 +523,7 @@ def _calc_group_cast_a2a_output_args(
             device=output.device,
         )
 
-    # -----     group_cast_a2a_output tensor sargs     ----- #
+    # -----     group_cast_a2a_output tensor args     ----- #
 
     a2a_output = output
 
@@ -329,13 +583,6 @@ def _calc_group_cast_a2a_args(
         unperm_after_a2a_kwargs=unperm_after_a2a_kwargs,
     )
 
-    # DE-BUG
-    logger.debug(
-        f"RANK {dist.get_rank()}:: args for group_cast_collective: {input.shape=}, {output.shape=}, "
-        f"{input_split_size_list=}, {output_split_size_list=}, {dst_indices_list=}, {src_index_list=}, "
-        f"args: {a2a_input.shape=}, {a2a_output.shape=}, {a2a_output_split_size=}, {a2a_input_split_size=}, "
-    )
-
     return (
         a2a_output,
         a2a_input,
@@ -348,9 +595,72 @@ def _calc_group_cast_a2a_args(
 # ------------------        utils for group reduce collective       ------------------ #
 
 
-# TODO: fuse this kernel in the future
-# FIXME: if using torch.compile, it's fused incompletely w/o performance gain
-# what's worse, the re-compilation in online exps would hang the comm
+def sanity_check_for_group_reduce_meta_args_per_rank(
+    input_split_size_list_per_rank: list[list[int]],
+    output_split_size_list_per_rank: list[list[int]],
+    dst_index_list_per_rank: list[list[int]],
+    src_indices_list_per_rank: list[list[list[int]]],
+    world_size: int,
+    check_nccl_send_recv: bool = False,
+) -> None:
+    for rank in range(world_size):
+        # sanity check for shape
+        input_split_size_list = input_split_size_list_per_rank[rank]
+        output_split_size_list = output_split_size_list_per_rank[rank]
+        dst_index_list = dst_index_list_per_rank[rank]
+        src_indices_list = src_indices_list_per_rank[rank]
+        assert len(input_split_size_list) == len(dst_index_list), (
+            f"input_split_size_list and dst_index_list should have the same length, "
+            f"but got {len(input_split_size_list)=} and {len(dst_index_list)=}"
+        )
+        assert len(output_split_size_list) == len(src_indices_list), (
+            f"output_split_size_list and src_indices_list should have the same length, "
+            f"but got {len(output_split_size_list)=} and {len(src_indices_list)=}"
+        )
+
+        # sanity check for rank value
+        assert all(0 <= dst_rank < world_size for dst_rank in dst_index_list), (
+            f"dst_index_list should contain ranks in [0, {world_size - 1}], "
+            f"but got {dst_index_list=}"
+        )
+        assert all(
+            0 <= src_rank < world_size for src_rank in chain(*src_indices_list)
+        ), (
+            f"src_indices_list should contain ranks in [0, {world_size - 1}], "
+            f"but got {src_indices_list=}"
+        )
+
+    # sanity check for src rank order and unique
+    for src_indices in src_indices_list:
+        assert src_indices == sorted(
+            list(set(src_indices))
+        ), f"src_indices should be sorted and unique, but got {src_indices_list=}"
+
+    # sanity check for nccl send/recv consistent number of calls
+    if check_nccl_send_recv:
+        # num_send[src_rank*world_size + dst_rank]: the number of nccl send calls launched by src_rank for dst_rank
+        num_send_list: list[int] = [0] * world_size**2
+        # num_recv[src_rank*world_size + dst_rank]: the number of nccl recv calls launched by dst_rank for src_rank
+        num_recv_list: list[int] = [0] * world_size**2
+
+        for rank in range(world_size):
+            src_rank = rank
+            dst_index_list = dst_index_list_per_rank[src_rank]
+            for dst_rank in dst_index_list:
+                num_send_list[src_rank * world_size + dst_rank] += 1
+
+            dst_rank = rank
+            src_indices_list = src_indices_list_per_rank[dst_rank]
+            for src_rank in chain(*src_indices_list):
+                num_recv_list[src_rank * world_size + dst_rank] += 1
+
+        _sanity_check_nccl_send_recv(
+            num_send_list=num_send_list,
+            num_recv_list=num_recv_list,
+            world_size=world_size,
+        )
+
+
 @nvtx.instrument_nvtx
 def _reduce_to_tensor(
     output: torch.Tensor,
@@ -436,6 +746,7 @@ def _calc_group_reduce_a2a_output_meta_args(
     src_indices_list: list[list[int]],
     world_size: int,
     device: torch.device,
+    deterministic: bool = False,
 ) -> tuple[list[int], dict]:
     # phase1 meta
     a2a_output_split_size = [0 for _ in range(world_size)]
@@ -469,30 +780,12 @@ def _calc_group_reduce_a2a_output_meta_args(
         )
 
     # calc range_reduce kwargs
-    input_ranges = []
-    output_ranges = []
-    cu_range_sizes = [0]
-    total_size = 0
-    for (out_start, out_end), reduce_ranges in zip(
-        output_size_ranges, a2a_output_reduce_ranges_list
-    ):
-        for reduce_start, reduce_end in reduce_ranges:
-            input_ranges.append([reduce_start, reduce_end])
-            output_ranges.append([out_start, out_end])
-            cu_range_sizes.append(reduce_end - reduce_start)
-            total_size += reduce_end - reduce_start
-
-    input_ranges = torch.tensor(input_ranges, dtype=torch.int32)
-    output_ranges = torch.tensor(output_ranges, dtype=torch.int32)
-    cu_range_sizes = torch.tensor(cu_range_sizes, dtype=torch.int32)
-    cu_range_sizes = torch.cumsum(cu_range_sizes, dim=0)
-
-    range_reduce_kwargs = {
-        "input_ranges": input_ranges.to(device),
-        "output_ranges": output_ranges.to(device),
-        "cu_range_sizes": cu_range_sizes.to(device),
-        "total_size": total_size,
-    }
+    range_reduce_kwargs = _calc_range_reduce_kwargs_from_ranges(
+        cu_ranges=output_size_ranges,
+        reduce_ranges_list=a2a_output_reduce_ranges_list,
+        device=device,
+        deterministic=deterministic,
+    )
 
     return (
         a2a_output_split_size,
@@ -522,6 +815,7 @@ def _calc_group_reduce_a2a_output_args(
             src_indices_list=src_indices_list,
             world_size=world_size,
             device=output.device,
+            deterministic=kwargs.get("deterministic", False),
         )
 
     # -----     group_reduce_a2a_output tensor args     ----- #
@@ -589,13 +883,6 @@ def _calc_group_reduce_a2a_args(
         range_reduce_kwargs=range_reduce_kwargs,
     )
 
-    # DE-BUG
-    logger.debug(
-        f"RANK {dist.get_rank()}:: args for group_reduce_collective: {input.shape=}, {output.shape=}, "
-        f"{input_split_size_list=}, {output_split_size_list=}, {dst_index_list=}, {src_indices_list=}. "
-        f"args: {a2a_input.shape=}, {a2a_output.shape=}, {a2a_output_split_size=}, {a2a_input_split_size=}, "
-    )
-
     return (
         a2a_output,
         a2a_input,
@@ -603,39 +890,3 @@ def _calc_group_reduce_a2a_args(
         a2a_input_split_size,
         post_process_fn,
     )
-
-
-# ------------------        utils for all-gather-v       ------------------ #
-
-
-def _trans_with_dim0(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
-    is_first_dim = dim == 0 or (dim == -1 and len(x.shape) == 1)
-
-    if not is_first_dim:
-        x = x.transpose(0, dim)
-    if not x.is_contiguous():
-        x = x.contiguous()
-
-    return x
-
-
-def _get_dims_as_trans_with_dim0(
-    x_shape: list[int],
-    dim: int = 0,
-) -> tuple[int, list[int]]:
-    shape_len = len(x_shape)
-    assert dim == -1 or 0 <= dim < len(
-        x_shape
-    ), f"dim should be in [0, {shape_len - 1}) or -1"
-
-    this_dim = x_shape[dim]
-
-    other_dims = x_shape.copy()
-    other_dims[0] = this_dim
-    other_dims[dim] = x_shape[0]
-    other_dims = other_dims[1:]
-
-    return this_dim, other_dims
-
-
-# ------------------        utils for scatter-v       ------------------ #

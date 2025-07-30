@@ -14,15 +14,17 @@
 
 from bisect import bisect_left
 from collections import defaultdict
-from dataclasses import dataclass
-from enum import Enum
 from itertools import chain
-from typing import Iterator
+from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
 import magi_attention
+from magi_attention.comm.primitive.utils import (
+    sanity_check_for_group_cast_meta_args_per_rank,
+)
 from magi_attention.common.enum import AttnMaskType, AttnOverlapMode
 from magi_attention.common.range import AttnRange
 from magi_attention.common.ranges import AttnRanges
@@ -31,858 +33,23 @@ from magi_attention.meta.collection.comm_meta import CommMeta, GroupCollectiveAr
 from magi_attention.meta.collection.dispatch_meta import DispatchMeta
 from magi_attention.meta.container.bucket import AttnBucket
 from magi_attention.meta.container.chunk import AttnChunk
+from magi_attention.meta.container.rank_entry import HostRankEntry, RemoteRankEntry
 from magi_attention.meta.container.slice import AttnSlice, MultiKAttnSlice
-from magi_attention.utils import nvtx, transpose_matrix
+from magi_attention.meta.container.transfer_table import (
+    GroupCastRanges,
+    TransferInfo,
+    TransferTable,
+)
+from magi_attention.utils import (
+    is_same_device_mesh,
+    is_same_process_group,
+    nvtx,
+    transpose_matrix,
+)
+from magi_attention.utils._utils import argsort
 
+from ._slice_maker import HostAttnSliceMaker, RemoteAttnSliceMaker
 from .overlap_solver import OverlapConfig, OverlapSolver, OverlapStageCost
-
-
-class AttnRangeWithRank(AttnRange):
-    def __init__(self, rank_set: set[int], *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.rank_set = rank_set
-
-
-class GroupCastRanges(AttnRanges):
-    def __init__(
-        self,
-        cp_size: int,
-        ranges_per_rank: list[AttnRanges],
-        split: bool = True,
-    ):
-        super().__init__()
-
-        assert len(ranges_per_rank) == cp_size
-        self._ranges: list[AttnRangeWithRank] = []  # type: ignore
-
-        for cp_rank, ranges in enumerate(ranges_per_rank):
-            for r in ranges:
-                self._ranges.append(
-                    AttnRangeWithRank(rank_set={cp_rank}, start=r.start, end=r.end)
-                )
-
-        # sort by attn_range.start
-        self._ranges.sort(key=lambda attn_range: attn_range.start)
-
-        if split:
-            self._split()
-
-    @nvtx.instrument_nvtx
-    def _split(self) -> None:
-        """Split the ranges group as fragmented as possible"""
-
-        if len(self._ranges) <= 1:
-            return
-
-        new_ranges: list[AttnRangeWithRank] = []
-
-        # 对每个区间[p1,p2]判断它被哪些原始range覆盖
-        all_points = self.points
-        for i in range(len(all_points) - 1):
-            p1, p2 = all_points[i], all_points[i + 1]
-
-            # 找出所有覆盖这个区间的ranges
-            cover_rank_set = set()
-            for r in self._ranges:
-                if r.start <= p1 and r.end >= p2:
-                    cover_rank_set.update(r.rank_set)
-
-            if cover_rank_set:  # 如果有range覆盖这个区间
-                new_ranges.append(
-                    AttnRangeWithRank(rank_set=cover_rank_set, start=p1, end=p2)
-                )
-
-        self._ranges = new_ranges
-
-    def __iter__(self) -> Iterator[AttnRangeWithRank]:
-        return iter(self._ranges)
-
-
-@dataclass
-class HostRankEntry:
-    """
-    HostRankEntry is a dataclass that contains the host q/k ranges and the remote k ranges,
-    it is a key data structure for calculating the remote rank entry.
-
-    Args:
-        host_q_ranges_global: global q ranges for this rank, merged
-        host_k_ranges_global: global k ranges for this rank, merged
-
-        attn_calc_slice_global_list: contains all slices to be calculated on this rank,
-            including all slices from both host_stage and remote_stage
-        attn_calc_host_slice_local_list: slices that need to be calculated in the host_stage
-
-        remote_k_ranges_global_hb_domain: global k ranges for the high-bandwidth domain, merged
-        attn_calc_remote_slice_list_hb_domain: contains all slices in the remote_stage located in the high-bandwidth domain
-
-        remote_k_ranges_global_lb_domain: global k ranges for the low-bandwidth domain, merged
-        remote_k_ranges_global_per_chunk: global k ranges for each chunk in the low-bandwidth domain,
-            these are the k ranges needed by the attn slices in this chunk.
-            the remote_k_ranges_global for each chunk is merged
-        attn_calc_remote_slice_list_per_chunk: contains slices that need to be calculated
-            for each chunk in the low-bandwidth domain
-    """
-
-    host_q_ranges_global: AttnRanges
-    host_k_ranges_global: AttnRanges
-    attn_calc_slice_global_list: list[AttnSlice]
-    attn_calc_host_slice_local_list: list[AttnSlice]
-
-    # NOTE: Each element in this list is a MultiKAttnSlice, which contains
-    # one q_range_global and multiple k_ranges_global, where all k_ranges_global
-    # are located in the high-bandwidth domain
-    remote_k_ranges_global_hb_domain: AttnRanges
-    attn_calc_remote_slice_list_hb_domain: list[MultiKAttnSlice]
-
-    remote_k_ranges_global_lb_domain: AttnRanges
-    # NOTE: We only chunknize remote k_ranges located in the low-bandwidth domain,
-    # so attn_calc_remote_slice_list_per_chunk only contains remote k_ranges in the low-bandwidth domain
-    remote_k_ranges_global_per_chunk: list[AttnRanges]
-    # NOTE: this is a special attr to support multi-stage overlap
-    # each multik_slice of which contains a q_range_local and a k_ranges_global
-    # where the k_ranges_global won't be made local until the multi-stage overlap problem solved
-    attn_calc_remote_slice_list_per_chunk: list[list[MultiKAttnSlice]]
-
-    def __post_init__(self):
-        assert len(self.remote_k_ranges_global_per_chunk) == len(
-            self.attn_calc_remote_slice_list_per_chunk
-        ), (
-            f"The number of chunks is inconsistent: "
-            f"{len(self.remote_k_ranges_global_per_chunk)=}, {len(self.attn_calc_remote_slice_list_per_chunk)=}"
-        )
-
-    def get_host_calc_area(self) -> int:
-        """Get the host calc area"""
-        return sum(
-            attn_slice.area for attn_slice in self.attn_calc_host_slice_local_list
-        )
-
-    def get_remote_calc_area(self, chunk_idx: int | None = None) -> int:
-        """Get the remote calc area (w.r.t. a specific chunk)"""
-        if chunk_idx is None:  # return the remote calc area for all chunks
-            return sum(
-                attn_slice.area
-                for attn_slice in chain(*self.attn_calc_remote_slice_list_per_chunk)
-            )
-        return sum(
-            attn_slice.area
-            for attn_slice in self.attn_calc_remote_slice_list_per_chunk[chunk_idx]
-        )
-
-    def get_remote_comm_size(self, chunk_idx: int | None = None) -> int:
-        """Get the remote comm size (w.r.t. a specific chunk)"""
-        if chunk_idx is None:  # return the remote comm size for all chunks
-            return sum(
-                remote_k_ranges.total_seqlen
-                for remote_k_ranges in self.remote_k_ranges_global_per_chunk
-            )
-
-        return self.remote_k_ranges_global_per_chunk[chunk_idx].total_seqlen
-
-
-@dataclass
-class RemoteRankEntry:
-    """
-    RemoteRankEntry is a dataclass that contains the remote k ranges and the local k ranges,
-    it is a key data structure for calculating the transfer table.
-
-    Args:
-        host_k_ranges_global: k_ranges_global owned by the host rank, merged.
-        remote_k_ranges_global: k_ranges_global owned by the remote rank, merged.
-            Represents the remote kv needed by the host rank in the current overlap stage.
-
-        attn_calc_remote_slice_local_list: Represents the attention calculations that the
-            host rank needs to perform in the current overlap stage.
-    """
-
-    host_k_ranges_global: AttnRanges
-    remote_k_ranges_global: AttnRanges
-
-    attn_calc_remote_slice_local_list: list[AttnSlice]
-
-
-class HostAttnSliceMaker:
-    class CausalCaseKey(Enum):
-        INVALID = "invalid"
-        RECTANGLE = "full_rectangle"
-        TRAPEZOID = "uncut_triangle_or_trapezoid"
-        TRIANGLE = "cut_triangle_on_the_far_right"
-        PENTAGON = "rotated_trapezoid_or_pentagon"
-
-    def __init__(
-        self,
-        q_range_local: AttnRange,
-        k_ranges_local: AttnRanges,
-        k_ranges_global: AttnRanges,
-        calc_k_range_global: AttnRange,
-        mask_type_global: AttnMaskType,
-    ):
-        """
-        Args:
-            q_range_local (AttnRange): the host q range local
-            k_ranges_local (AttnRanges): the host k ranges local
-                which remains unmerged, and will be merged in the specific case
-            k_ranges_global (AttnRanges): the host k ranges global
-                which should be guaranteed to be non-empty from outside
-            calc_k_range_global (AttnRange): the host k range global for the original calc slice
-            mask_type_global (AttnMaskType): the attn mask type for the original calc slice
-        """
-        self.q_range_local = q_range_local
-        self.k_ranges_local = k_ranges_local
-        self.k_ranges_global = k_ranges_global
-        self.calc_k_range_global = calc_k_range_global
-        self.mask_type_global = mask_type_global
-
-        # init for causal
-        if self.mask_type_global is AttnMaskType.CAUSAL:
-            self._init_causal()
-
-    def _init_causal(self) -> None:
-        self.last_k_range_global = self.k_ranges_global[-1]
-
-        # ---- calc the start and end of the causal area ---- #
-
-        if self.calc_k_range_global.seqlen > self.q_range_local.seqlen:
-            # the causal mask of a trapezoid
-            self.causal_mask_start = (
-                self.calc_k_range_global.end - self.q_range_local.seqlen
-            )
-        else:
-            # the causal mask of a triangle or a null slice
-            self.causal_mask_start = self.calc_k_range_global.start
-
-        self.causal_mask_end = self.calc_k_range_global.end
-
-        self.exceed_causal_start = (
-            self.last_k_range_global.start - self.causal_mask_start
-        )
-
-        # when q_range.seqlen > k_range.seqlen, exceed_causal_end is
-        # just a part of the actual exceeded length
-        self.exceed_causal_end = self.last_k_range_global.end - self.causal_mask_start
-        # it needs to add the difference between the lengths of q_range and k_range in slice
-        self.diff_len_of_q_range_minus_k_range = max(
-            0,
-            self.q_range_local.seqlen - self.calc_k_range_global.seqlen,
-        )
-
-        # ---- determine the causal case key ---- #
-
-        self._init_causal_case_key()
-
-    def _init_causal_case_key(self) -> None:
-        self.causal_case_key = self.CausalCaseKey.INVALID
-        if (
-            self.last_k_range_global.start <= self.causal_mask_start
-            and self.last_k_range_global.end <= self.causal_mask_start
-        ):
-            # case1: the area will be formed as a full rectangle mask
-            self.causal_case_key = self.CausalCaseKey.RECTANGLE
-        elif (
-            self.last_k_range_global.start <= self.causal_mask_start
-            and self.last_k_range_global.end == self.causal_mask_end
-        ):
-            # case2: the area will be formed as a normal causal mask,
-            # i.e. an uncut triangle or a trapezoid
-            self.causal_case_key = self.CausalCaseKey.TRAPEZOID
-        elif (
-            self.last_k_range_global.start > self.causal_mask_start
-            and self.last_k_range_global.end == self.causal_mask_end
-        ):
-            # case3: the area will be formed as a cut triangle on the far right
-            self.causal_case_key = self.CausalCaseKey.TRIANGLE
-        elif (
-            self.last_k_range_global.start <= self.causal_mask_start
-            and self.causal_mask_start
-            < self.last_k_range_global.end
-            < self.causal_mask_end
-        ):
-            # this includes two cases:
-            # case 4: the area of a rotated trapezoid or a pentagon,
-            #   when q_range.seqlen <= k_range.seqlen in the slice
-            # case 5: the area of a cut rotated trapezoid,
-            #   when q_range.seqlen > k_range.seqlen in the slice
-            self.causal_case_key = self.CausalCaseKey.PENTAGON
-
-    @nvtx.instrument_nvtx
-    def make(self) -> list[AttnSlice]:
-        match self.mask_type_global:
-            case AttnMaskType.FULL:
-                attn_slices = self._make_slice_for_full_mask()
-            case AttnMaskType.CAUSAL:
-                attn_slices = self._make_slice_for_causal_mask()
-            case _:
-                raise ValueError(f"Got invalid mask type {self.mask_type_global=}.")
-
-        return attn_slices
-
-    def _make_slice_for_full_mask(self) -> list[AttnSlice]:
-        """For full mask, just merge the k ranges local
-        to be a single k range and form a single attn slice
-        """
-
-        k_range_local = self._merge_k_ranges_and_check(
-            self.k_ranges_local,
-            allow_empty=False,
-        )
-
-        return [
-            AttnSlice(
-                q_range=self.q_range_local,
-                k_range=k_range_local,
-                mask_type=AttnMaskType.FULL,
-            )
-        ]
-
-    def _make_slice_for_causal_mask(self) -> list[AttnSlice]:
-        """For causal mask, there're more than one cases to be considered"""
-
-        match self.causal_case_key:
-            case self.CausalCaseKey.RECTANGLE:
-                attn_slices = self._make_slice_for_causal_rectangle_mask()
-            case self.CausalCaseKey.TRAPEZOID:
-                attn_slices = self._make_slice_for_causal_trapezoid_mask()
-            case self.CausalCaseKey.TRIANGLE:
-                attn_slices = self._make_slice_for_causal_triangle_mask()
-            case self.CausalCaseKey.PENTAGON:
-                attn_slices = self._make_slice_for_causal_pentagon_mask()
-            case self.CausalCaseKey.INVALID:
-                raise ValueError(
-                    f"Got invalid range {self.last_k_range_global=} "
-                    f"when {self.causal_mask_start=} and {self.causal_mask_end=}."
-                )
-            case _:
-                raise ValueError(
-                    f"Got invalid causal case key {self.causal_case_key=}."
-                )
-
-        return attn_slices
-
-    def _make_slice_for_causal_rectangle_mask(self) -> list[AttnSlice]:
-        """in such case, we just call the maker for full mask,
-        since a causal rectangle mask equals to a full mask
-        """
-
-        return self._make_slice_for_full_mask()
-
-    def _make_slice_for_causal_trapezoid_mask(self) -> list[AttnSlice]:
-        """in such case, the whole mask will be a single
-        normal causal mask after merged
-        """
-
-        k_range_local = self._merge_k_ranges_and_check(
-            self.k_ranges_local,
-            allow_empty=False,
-        )
-
-        return [
-            AttnSlice(
-                q_range=self.q_range_local,
-                k_range=k_range_local,
-                mask_type=AttnMaskType.CAUSAL,
-            )
-        ]
-
-    def _make_slice_for_causal_triangle_mask(self) -> list[AttnSlice]:
-        """in such case, the mask will be formed as two parts:
-        part1: an optional full mask merged from the previous k ranges
-        part2: a causal mask on the far right made by the last k range
-        """
-
-        attn_slices: list[AttnSlice] = []
-
-        # part1 (optional): previous full mask
-        previous_full_k_ranges_local = self.k_ranges_local[:-1]
-        previous_full_k_range_local = self._merge_k_ranges_and_check(
-            previous_full_k_ranges_local,
-            allow_empty=True,
-        )
-
-        # TODO: The current solution is to divide the slice into a complete rectangle and a small triangle.
-        # TODO: The slice can be cut into a rectangle and a trapezoid to ensure that the k_range is not divided.
-        if not previous_full_k_range_local.is_empty():
-            attn_slices.append(
-                AttnSlice(
-                    q_range=self.q_range_local,
-                    k_range=previous_full_k_range_local,
-                    mask_type=AttnMaskType.FULL,
-                )
-            )
-
-        # part2: causal mask on the far right
-        last_causal_k_range_local = self.k_ranges_local[-1]
-        last_causal_q_range_local = AttnRange(
-            start=self.q_range_local.end - self.last_k_range_global.seqlen,
-            end=self.q_range_local.end,
-        )
-        attn_slices.append(
-            AttnSlice(
-                q_range=last_causal_q_range_local,
-                k_range=last_causal_k_range_local,
-                mask_type=AttnMaskType.CAUSAL,
-            )
-        )
-
-        return attn_slices
-
-    def _make_slice_for_causal_pentagon_mask(self) -> list[AttnSlice]:
-        """in such case, the mask has to divide from the middle into two parts:
-        part1: the top causal mask
-        part2: the bottom full mask
-        """
-
-        attn_slices: list[AttnSlice] = []
-
-        k_range_local = self._merge_k_ranges_and_check(
-            self.k_ranges_local,
-            allow_empty=False,
-        )
-
-        # part1: top causal mask
-        top_causal_q_range_local = AttnRange(
-            start=self.q_range_local.start,
-            end=self.q_range_local.start
-            + self.exceed_causal_end
-            + self.diff_len_of_q_range_minus_k_range,
-        )
-        attn_slices.append(
-            AttnSlice(
-                q_range=top_causal_q_range_local,
-                k_range=k_range_local,
-                mask_type=AttnMaskType.CAUSAL,
-            ),
-        )
-
-        # part2: bottom full mask
-        bottom_full_q_range_local = AttnRange(
-            start=self.q_range_local.start
-            + self.exceed_causal_end
-            + self.diff_len_of_q_range_minus_k_range,
-            end=self.q_range_local.end,
-        )
-        attn_slices.append(
-            AttnSlice(
-                q_range=bottom_full_q_range_local,
-                k_range=k_range_local,
-                mask_type=AttnMaskType.FULL,
-            ),
-        )
-
-        return attn_slices
-
-    def _merge_k_ranges_and_check(
-        self,
-        k_ranges: AttnRanges,
-        allow_empty: bool = False,
-    ) -> AttnRange:
-        k_ranges = k_ranges.merge()
-        is_empty = k_ranges.is_empty()
-
-        # sanity check
-        if magi_attention.is_sanity_check_enable():
-            # the local ranges are always contains only a single range after merged
-            assert len(k_ranges) <= 1
-            # unless it is empty
-            assert not is_empty or allow_empty
-
-        if is_empty:
-            return AttnRange(0, 0)
-
-        return k_ranges[0]
-
-
-class RemoteAttnSliceMaker(HostAttnSliceMaker):
-    def __init__(
-        self,
-        q_range_local: AttnRange,
-        k_ranges_global: AttnRanges,
-        calc_k_range_global: AttnRange,
-        mask_type_global: AttnMaskType,
-    ):
-        """
-        Args:
-            q_range_local (AttnRange): the host q range local
-            k_ranges_global (AttnRanges): the remote k ranges global
-                which should be guaranteed to be non-empty from outside
-            calc_k_range_global (AttnRange): the remote k range global for the original calc slice
-            mask_type_global (AttnMaskType): the attn mask type for the original calc slice
-        """
-        super().__init__(
-            q_range_local=q_range_local,
-            k_ranges_local=AttnRanges(),  # just a placeholder, not used
-            k_ranges_global=k_ranges_global,
-            calc_k_range_global=calc_k_range_global,
-            mask_type_global=mask_type_global,
-        )
-        del self.k_ranges_local  # this attr is not used, so del it
-
-        self.batch_size = len(self.k_ranges_global)
-
-    def _init_causal_case_key(self) -> None:
-        super()._init_causal_case_key()
-
-        if self.causal_case_key is self.CausalCaseKey.PENTAGON:
-            self.special_pentagon_case_type = False
-        elif self.causal_case_key is self.CausalCaseKey.INVALID:
-            if (
-                self.last_k_range_global.start > self.causal_mask_start
-                and self.causal_mask_start
-                < self.last_k_range_global.end
-                < self.causal_mask_end
-            ):
-                # this contains special sub-type of cases for the pentagon cases
-                # that will be just invalid in host slice maker
-                self.causal_case_key = self.CausalCaseKey.PENTAGON
-                self.special_pentagon_case_type = True
-
-    def _make_slice_for_full_mask(self) -> list[MultiKAttnSlice]:  # type: ignore[override]
-        """For full mask, we just wrap the args to a single multi-k attn slice"""
-
-        return [
-            MultiKAttnSlice(
-                q_range=self.q_range_local,
-                k_ranges=self.k_ranges_global,
-                mask_types=[AttnMaskType.FULL] * self.batch_size,
-            )
-        ]
-
-    def _make_slice_for_causal_rectangle_mask(self) -> list[MultiKAttnSlice]:  # type: ignore[override]
-        """in such case, the area is made of only several full rectangles
-
-        thus we just call the maker for full mask
-        """
-
-        return self._make_slice_for_full_mask()
-
-    def _make_slice_for_causal_trapezoid_mask(self) -> list[MultiKAttnSlice]:  # type: ignore[override]
-        """in such case, the area is made of several full rectangles
-        plus a single normal causal mask, i.e. an uncut triangle or an uncut trapezoid
-
-        thus the whole masks will be formed as
-        the previous full masks plus a single normal causal mask in the last
-        """
-
-        return [
-            MultiKAttnSlice(
-                q_range=self.q_range_local,
-                k_ranges=self.k_ranges_global,
-                mask_types=[AttnMaskType.FULL] * (self.batch_size - 1)
-                + [AttnMaskType.CAUSAL],
-            )
-        ]
-
-    def _make_slice_for_causal_triangle_mask(self) -> list[MultiKAttnSlice]:  # type: ignore[override]
-        """in such case, the area is made of several full rectangles
-        plus a cut triangle on the far bottom-right
-
-        the whole masks can be divided from the middle into two parts:
-            part1: the optional top full masks
-            part2: the bottom previous full masks plus a single normal causal mask in the last
-        """
-
-        attn_slices: list[MultiKAttnSlice] = []
-
-        triangle_start = self.q_range_local.end - self.last_k_range_global.seqlen
-
-        # part1: optional top full masks
-        full_q_range_local = AttnRange(
-            start=self.q_range_local.start,
-            end=triangle_start,
-        )
-        if self.batch_size > 1:
-            attn_slices.append(
-                MultiKAttnSlice(
-                    q_range=full_q_range_local,
-                    k_ranges=self.k_ranges_global[:-1],
-                    mask_types=[AttnMaskType.FULL] * (self.batch_size - 1),
-                )
-            )
-
-        # part2: bottom full masks + causal mask
-        causal_q_range_local = AttnRange(
-            start=triangle_start,
-            end=self.q_range_local.end,
-        )
-        attn_slices.append(
-            MultiKAttnSlice(
-                q_range=causal_q_range_local,
-                k_ranges=self.k_ranges_global,
-                mask_types=[AttnMaskType.FULL] * (self.batch_size - 1)
-                + [AttnMaskType.CAUSAL],
-            )
-        )
-
-        return attn_slices
-
-    def _make_slice_for_causal_pentagon_mask(self) -> list[MultiKAttnSlice]:  # type: ignore[override]
-        """this includes three cases, where the area is made of several full rectangles
-        plus either an uncut/cut rotated trapezoid or a pentagon
-
-        we further dispatch them into two sub types of cases:
-            normal type: the plused rotated trapezoid is uncut
-            special type: the plused rotated trapezoid is cut
-        """
-
-        if self.special_pentagon_case_type:
-            return self._make_slice_for_causal_pentagon_mask_special()
-        else:
-            return self._make_slice_for_causal_pentagon_mask_normal()
-
-    def _make_slice_for_causal_pentagon_mask_normal(self) -> list[MultiKAttnSlice]:  # type: ignore[override]
-        """this normal type includes two cases:
-            case1: the area is made of several full rectangles
-                plus either an uncut rotated trapezoid or a pentagon,
-                when q_range.seqlen <= k_range.seqlen in a slice
-            case2: the area is made of a single cut rotated trapezoid,
-                when q_range.seqlen > k_range.seqlen in a slice
-
-        thus the whole masks can be divided from the middle into two parts:
-            part1: the top previous full masks plus a single normal causal mask in the last
-            part2: the bottom full masks
-        """
-
-        attn_slices: list[MultiKAttnSlice] = []
-
-        # part1: top full masks + causal mask
-        top_causal_q_range_local = AttnRange(
-            start=self.q_range_local.start + self.diff_len_of_q_range_minus_k_range,
-            end=self.q_range_local.start
-            + self.exceed_causal_end
-            + self.diff_len_of_q_range_minus_k_range,
-        )
-        attn_slices.append(
-            MultiKAttnSlice(
-                q_range=top_causal_q_range_local,
-                k_ranges=self.k_ranges_global,
-                mask_types=[AttnMaskType.FULL] * (self.batch_size - 1)
-                + [AttnMaskType.CAUSAL],
-            )
-        )
-
-        # part2: bottom full masks
-        bottom_full_q_range_local = AttnRange(
-            start=self.q_range_local.start
-            + self.exceed_causal_end
-            + self.diff_len_of_q_range_minus_k_range,
-            end=self.q_range_local.end,
-        )
-        attn_slices.append(
-            MultiKAttnSlice(
-                q_range=bottom_full_q_range_local,
-                k_ranges=self.k_ranges_global,
-                mask_types=[AttnMaskType.FULL] * self.batch_size,
-            )
-        )
-
-        return attn_slices
-
-    def _make_slice_for_causal_pentagon_mask_special(self) -> list[MultiKAttnSlice]:  # type: ignore[override]
-        """this special type includes two cases:
-            case1: the area is made of several full rectangles
-                plus a cut rotated trapezoid,
-                when q_range.seqlen <= k_range.seqlen in a slice
-            case2: the area is made of a single cut rotated trapezoid,
-                when q_range.seqlen > k_range.seqlen in a slice
-            NOTE: the case2 of the special type is the same as the case2 of the normal type
-            we just handle each case2 with the same way as its corr. case1
-
-        thus the whole masks can be divided from the middle into three parts:
-            part1: the top optional full masks
-            part2: the middle full masks plus a single normal causal mask in the last
-            part3: the bottom full masks
-        """
-
-        attn_slices: list[MultiKAttnSlice] = []
-
-        # part1: top optional full masks
-        top_full_q_range_local = AttnRange(
-            start=self.q_range_local.start,
-            end=self.q_range_local.start
-            + self.exceed_causal_start
-            + self.diff_len_of_q_range_minus_k_range,
-        )
-        if self.batch_size > 1:
-            attn_slices.append(
-                MultiKAttnSlice(
-                    q_range=top_full_q_range_local,
-                    k_ranges=self.k_ranges_global[:-1],
-                    mask_types=[AttnMaskType.FULL] * (self.batch_size - 1),
-                )
-            )
-
-        # part2: middle full masks + causal mask
-        mid_causal_q_range_local = AttnRange(
-            start=self.q_range_local.start
-            + self.exceed_causal_start
-            + self.diff_len_of_q_range_minus_k_range,
-            end=self.q_range_local.start
-            + self.exceed_causal_end
-            + self.diff_len_of_q_range_minus_k_range,
-        )
-        attn_slices.append(
-            MultiKAttnSlice(
-                q_range=mid_causal_q_range_local,
-                k_ranges=self.k_ranges_global,
-                mask_types=[AttnMaskType.FULL] * (self.batch_size - 1)
-                + [AttnMaskType.CAUSAL],
-            )
-        )
-
-        # part3: bottom full masks
-        bottom_full_q_range_local = AttnRange(
-            start=self.q_range_local.start
-            + self.exceed_causal_end
-            + self.diff_len_of_q_range_minus_k_range,
-            end=self.q_range_local.end,
-        )
-        attn_slices.append(
-            MultiKAttnSlice(
-                q_range=bottom_full_q_range_local,
-                k_ranges=self.k_ranges_global,
-                mask_types=[AttnMaskType.FULL] * self.batch_size,
-            )
-        )
-
-        return attn_slices
-
-
-@dataclass
-class TransferInfo:
-    k_ranges_global_recv_from_per_rank: list[AttnRanges]
-    k_ranges_local_recv_from_per_rank: list[AttnRanges]
-    k_ranges_global_send_to_per_rank: list[AttnRanges]
-    k_ranges_local_send_to_per_rank: list[AttnRanges]
-
-    group_cast_ranges_global_transfer: GroupCastRanges
-    group_cast_ranges_local_send_to: GroupCastRanges
-
-
-@dataclass
-class TableEntry:
-    """The entry dataclass for transfer table,
-    where:
-        1. k_ranges_global: global k ranges to send w.r.t. send rank's dispatch meta
-        2. k_ranges_local_in_send_buf: local k ranges to send w.r.t. send rank's send buf
-        3. k_ranges_local_in_recv_buf: local k ranges to send w.r.t. recv rank's recv buf
-    """
-
-    k_ranges_global: AttnRanges
-    k_ranges_local_in_send_buf: AttnRanges
-    k_ranges_local_in_recv_buf: AttnRanges
-
-
-class TransferTable:
-    """The transfer table class, maintaining [cp_size, cp_size] entries,
-    where table[send_rank][recv_rank] is the send entry from send_rank to recv_rank
-
-    Therefore:
-        1. we can get the send args for group collective
-            using 'k_ranges_local_in_send_buf' in the row of table[this_rank][...]
-        2. we can get the recv args for group collective
-            using 'k_ranges_local_in_recv_buf' in the column of table[...][this_rank]
-    """
-
-    def __init__(self, cp_size: int):
-        self.cp_size = cp_size
-        self._transfer_table: list[list[TableEntry]] = []
-
-        # init each entry in the transfer table
-        for send_rank in range(cp_size):
-            self._transfer_table.append([])
-            for recv_rank in range(cp_size):
-                self._transfer_table[send_rank].append(
-                    TableEntry(
-                        k_ranges_global=AttnRanges(),
-                        k_ranges_local_in_send_buf=AttnRanges(),
-                        k_ranges_local_in_recv_buf=AttnRanges(),
-                    )
-                )
-
-    # get
-    def get_k_ranges_global(
-        self,
-        send_rank: int,
-        recv_rank: int,
-    ) -> AttnRanges:
-        return self._transfer_table[send_rank][recv_rank].k_ranges_global
-
-    def get_k_ranges_local_in_send_buf(
-        self,
-        send_rank: int,
-        recv_rank: int,
-    ) -> AttnRanges:
-        return self._transfer_table[send_rank][recv_rank].k_ranges_local_in_send_buf
-
-    def get_k_ranges_local_in_recv_buf(
-        self,
-        send_rank: int,
-        recv_rank: int,
-    ) -> AttnRanges:
-        return self._transfer_table[send_rank][recv_rank].k_ranges_local_in_recv_buf
-
-    # append
-    def append_k_ranges_global(
-        self,
-        send_rank: int,
-        recv_rank: int,
-        k_range: AttnRange,
-    ) -> None:
-        self._transfer_table[send_rank][recv_rank].k_ranges_global.append(k_range)
-
-    def append_k_ranges_local_in_send_buf(
-        self,
-        send_rank: int,
-        recv_rank: int,
-        k_range: AttnRange,
-    ) -> None:
-        self._transfer_table[send_rank][recv_rank].k_ranges_local_in_send_buf.append(
-            k_range
-        )
-
-    # sort
-    def sort_k_ranges_global(
-        self,
-        send_rank: int,
-        recv_rank: int,
-    ) -> None:
-        self._transfer_table[send_rank][
-            recv_rank
-        ].k_ranges_global = self._transfer_table[send_rank][
-            recv_rank
-        ].k_ranges_global.sort()
-
-    def sort_k_ranges_local_in_send_buf(
-        self,
-        send_rank: int,
-        recv_rank: int,
-    ) -> None:
-        self._transfer_table[send_rank][
-            recv_rank
-        ].k_ranges_local_in_send_buf = self._transfer_table[send_rank][
-            recv_rank
-        ].k_ranges_local_in_send_buf.sort()
-
-    # make
-    def make_k_ranges_local_in_recv_buf(
-        self,
-        send_rank: int,
-        recv_rank: int,
-        remote_k_ranges_global_for_recv_rank: AttnRanges,
-    ) -> None:
-        """Construct local k_ranges w.r.t. recv rank's recv buffer
-        from host global k_ranges to send from send_rank to recv_rank
-        and remote global k_ranges to recv from send_rank to recv_rank
-
-        NOTE: this is the special attribute that should NOT be passed in from outside,
-        but ONLY constructed internally
-        """
-
-        self._transfer_table[send_rank][
-            recv_rank
-        ].k_ranges_local_in_recv_buf = remote_k_ranges_global_for_recv_rank.make_ranges_local(
-            self._transfer_table[send_rank][recv_rank].k_ranges_global,
-            is_self_merged=True,
-        )
 
 
 class DistAttnSolver:
@@ -895,17 +62,16 @@ class DistAttnSolver:
         dispatch_meta_q: DispatchMeta,
         dispatch_meta_k: DispatchMeta,
         cp_group: dist.ProcessGroup,
-        high_bandwith_domain_size: int,
         overlap_config: OverlapConfig,
+        cp_mesh: DeviceMesh | None = None,
     ):
-        assert dist.get_backend(cp_group) == dist.Backend.NCCL
-
         self.cp_rank = dist.get_rank(cp_group)
         self.cp_size = dist.get_world_size(cp_group)
         self.cp_group = cp_group
+        self.cp_mesh = cp_mesh
         self.shard_seqlen_q = dispatch_meta_q.shard_seqlen
         self.shard_seqlen_k = dispatch_meta_k.shard_seqlen
-        self.high_bandwith_domain_size = high_bandwith_domain_size
+        self.deterministic = magi_attention.is_deterministic_mode_enable()
 
         self.overlap_config = overlap_config
         self.overlap_solver = OverlapSolver(alg=self.overlap_config.alg)
@@ -929,8 +95,6 @@ class DistAttnSolver:
             host_q_ranges_global_this_rank,
             host_k_ranges_global_this_rank,
             remote_k_ranges_global_this_rank,
-            remote_k_ranges_global_hb_domain,
-            remote_k_ranges_global_lb_domain,
         ) = self._init_host_remote_ranges_global_this_rank(
             dispatch_meta_q=dispatch_meta_q,
             dispatch_meta_k=dispatch_meta_k,
@@ -942,15 +106,12 @@ class DistAttnSolver:
         self.host_q_ranges_global = host_q_ranges_global_this_rank
         self.host_k_ranges_global = host_k_ranges_global_this_rank
         self.remote_k_ranges_global = remote_k_ranges_global_this_rank
-        self.remote_k_ranges_global_hb_domain = remote_k_ranges_global_hb_domain
-        self.remote_k_ranges_global_lb_domain = remote_k_ranges_global_lb_domain
 
         # init host rank entry for this rank
         self.host_rank_entry_this_rank = self._init_host_rank_entry_this_rank(
             host_q_ranges_global=host_q_ranges_global_this_rank,
             host_k_ranges_global=host_k_ranges_global_this_rank,
-            remote_k_ranges_global_hb_domain=remote_k_ranges_global_hb_domain,
-            remote_k_ranges_global_lb_domain=remote_k_ranges_global_lb_domain,
+            remote_k_ranges_global=remote_k_ranges_global_this_rank,
             attn_calc_slice_global_list=bucket_this_rank.attn_slices,
         )
 
@@ -960,24 +121,6 @@ class DistAttnSolver:
                 self.host_rank_entry_this_rank
             )
         )
-
-        # init for hb domain remote stage if available
-        if self.high_bandwith_domain_size > 1:
-            # init remote rank entry for high-bandwidth domain stage this rank
-            remote_rank_entry_for_this_domain = (
-                self._init_remote_rank_entry_this_domain(
-                    host_rank_entry_this_rank=self.host_rank_entry_this_rank,
-                )
-            )
-            # HACK: prepend remote rank entry for high-bandwidth domain as the first stage
-            # and the overlap degree need plus 1, since hb remote rank entry is unaware by the overlap solver
-            # FIXME: therefore, the overlap solver will wrongly use the remote comm in first lb domain stage
-            # to overlap with the host calc, instead of the remote comm in hb domain
-            self.remote_rank_entry_per_stage_this_rank.insert(
-                0,
-                remote_rank_entry_for_this_domain,
-            )
-            self.overlap_degree += 1
 
         # init remote rank entry for each rank for each stage
         self.remote_rank_entry_per_rank_per_stage = (
@@ -999,7 +142,7 @@ class DistAttnSolver:
         dispatch_meta_q: DispatchMeta,
         dispatch_meta_k: DispatchMeta,
         bucket_this_rank: AttnBucket,
-    ) -> tuple[AttnRanges, AttnRanges, AttnRanges, AttnRanges, AttnRanges]:
+    ) -> tuple[AttnRanges, AttnRanges, AttnRanges]:
         # init host q_ranges global for this rank
         host_q_ranges_global_this_rank = dispatch_meta_q.host_ranges_per_rank[
             self.cp_rank
@@ -1017,33 +160,12 @@ class DistAttnSolver:
             is_other_merged=True,
         )
 
-        # split remote k_ranges global into high-bandwidth / low-bandwidth domain
-        host_k_ranges_global_this_domain = (
-            dispatch_meta_k.host_ranges_this_domain.merge()
-        )
-        remote_k_ranges_global_hb_domain = (
-            remote_k_ranges_global_this_rank.find_overlap_ranges(
-                host_k_ranges_global_this_domain,
-                is_self_merged=True,
-                is_other_merged=True,
-            )
-        )
-        remote_k_ranges_global_lb_domain = (
-            remote_k_ranges_global_this_rank.find_hole_ranges(
-                host_k_ranges_global_this_domain,
-                is_self_merged=True,
-                is_other_merged=True,
-            )
-        )
-
         # sanity check
         if magi_attention.is_sanity_check_enable():
             # check if merged successfully
             assert host_q_ranges_global_this_rank.is_merged()
             assert host_k_ranges_global_this_rank.is_merged()
             assert remote_k_ranges_global_this_rank.is_merged()
-            assert remote_k_ranges_global_hb_domain.is_merged()
-            assert remote_k_ranges_global_lb_domain.is_merged()
 
             # whether q_ranges and k_ranges are one-one mapping in attn calc
             attn_calc_q_ranges_global = bucket_this_rank.q_ranges
@@ -1053,32 +175,10 @@ class DistAttnSolver:
                 f"{len(attn_calc_k_ranges_global)=}."
             )
 
-            # check about high-bandwidth domain
-            intersect_ranges_between_hb_lb = (
-                remote_k_ranges_global_hb_domain.find_overlap_ranges(
-                    remote_k_ranges_global_lb_domain,
-                )
-            )
-            assert intersect_ranges_between_hb_lb.is_empty()  # they are orthogonal
-
-            if self.high_bandwith_domain_size == 1:
-                # in such case, host k ranges in this hb domain are exactly the host k ranges for this rank
-                # then there'll be no remote k ranges in this hb domain, and
-                # the remote k ranges in lb domain are exactly the remote k ranges for this rank
-                assert (
-                    host_k_ranges_global_this_rank == host_k_ranges_global_this_domain
-                )
-                assert remote_k_ranges_global_hb_domain.is_empty()
-                assert (
-                    remote_k_ranges_global_lb_domain == remote_k_ranges_global_this_rank
-                )
-
         return (
             host_q_ranges_global_this_rank,
             host_k_ranges_global_this_rank,
             remote_k_ranges_global_this_rank,
-            remote_k_ranges_global_hb_domain,
-            remote_k_ranges_global_lb_domain,
         )
 
     @nvtx.instrument_nvtx
@@ -1086,8 +186,7 @@ class DistAttnSolver:
         self,
         host_q_ranges_global: AttnRanges,
         host_k_ranges_global: AttnRanges,
-        remote_k_ranges_global_hb_domain: AttnRanges,
-        remote_k_ranges_global_lb_domain: AttnRanges,
+        remote_k_ranges_global: AttnRanges,
         attn_calc_slice_global_list: list[AttnSlice],
     ) -> HostRankEntry:
         """Initialize host rank entry for this rank"""
@@ -1095,9 +194,8 @@ class DistAttnSolver:
         # -------   chunk remote k ranges global  ------ #
 
         remote_k_ranges_global_per_chunk = self._chunk_remote_k_ranges_global(
-            # NOTE: we only chunk the remote k ranges in the low-bandwidth domain
-            # to be passed to overlap solver for multi-stage overlapping
-            remote_k_ranges_global=remote_k_ranges_global_lb_domain,
+            # NOTE: we only chunk the remote k ranges
+            remote_k_ranges_global=remote_k_ranges_global,
         )
 
         # -------   calc attn calc host q ranges local  ------ #
@@ -1111,7 +209,6 @@ class DistAttnSolver:
         # -------   make attn calc host/remote slices  ------ #
 
         attn_calc_host_slice_local_list: list[AttnSlice] = []
-        attn_calc_remote_slice_list_hb_domain: list[MultiKAttnSlice] = []
         attn_calc_remote_slice_list_per_chunk: list[list[MultiKAttnSlice]] = [
             [] for _ in range(len(remote_k_ranges_global_per_chunk))
         ]
@@ -1146,31 +243,15 @@ class DistAttnSolver:
                 ith_attn_slice_global_mask_type=ith_attn_slice_global_mask_type,
             )
 
-            # -------   make ith attn calc remote slice for hb domain  ------ #
-
-            self._make_ith_attn_calc_remote_slice(
-                remote_k_ranges_global=remote_k_ranges_global_hb_domain,
-                attn_calc_remote_slice_list=attn_calc_remote_slice_list_hb_domain,
-                ith_attn_calc_host_q_range_local=ith_attn_calc_host_q_range_local,
-                ith_attn_calc_k_ranges_global=ith_attn_calc_k_ranges_global,
-                ith_attn_slice_global_mask_type=ith_attn_slice_global_mask_type,
-            )
-
         host_rank_entry_this_rank = HostRankEntry(
             host_q_ranges_global=host_q_ranges_global,
             host_k_ranges_global=host_k_ranges_global,
             attn_calc_slice_global_list=attn_calc_slice_global_list,
             attn_calc_host_slice_local_list=attn_calc_host_slice_local_list,
-            remote_k_ranges_global_hb_domain=remote_k_ranges_global_hb_domain,
-            attn_calc_remote_slice_list_hb_domain=attn_calc_remote_slice_list_hb_domain,
-            remote_k_ranges_global_lb_domain=remote_k_ranges_global_lb_domain,
+            remote_k_ranges_global=remote_k_ranges_global,
             remote_k_ranges_global_per_chunk=remote_k_ranges_global_per_chunk,
             attn_calc_remote_slice_list_per_chunk=attn_calc_remote_slice_list_per_chunk,
         )
-
-        # DE-BUG: log host_rank_entry_this_rank
-        # from magi_attention.utils import write_rank
-        # write_rank(repr(host_rank_entry_this_rank), "host_rank_entry_this_rank.log")
 
         return host_rank_entry_this_rank
 
@@ -1302,8 +383,7 @@ class DistAttnSolver:
     ) -> None:
         """Make ith attn calc remote slice for the given remote k ranges global,
             and append to given 'attn_calc_remote_slice_list',
-            called in 'self._init_host_rank_entry_this_rank' directly for hb domain
-            and in 'self._make_ith_attn_calc_remote_slice_per_chunk' for jth chunk of lb domain
+            called in 'self._make_ith_attn_calc_remote_slice_per_chunk' for jth chunk of remote ranges
         HACK: inplace operation for 'attn_calc_remote_slice_list' for the purpose of performance,
               need further refactor.
         """
@@ -1395,36 +475,6 @@ class DistAttnSolver:
             ), f"{len(remote_rank_entry_per_rank_per_stage)=}, {self.overlap_degree=}, {self.cp_size=}"
 
         return remote_rank_entry_per_rank_per_stage
-
-    @nvtx.instrument_nvtx
-    def _init_remote_rank_entry_this_domain(
-        self,
-        host_rank_entry_this_rank: HostRankEntry,
-    ) -> RemoteRankEntry:
-        """Initialize remote rank entry for high-bandwidth domain
-        Args:
-            host_rank_entry_this_rank: HostRankEntry for this rank
-
-        Returns:
-            remote_rank_entry_for_hb_domain: RemoteRankEntry for high-bandwidth domain
-        """
-
-        slice_tuples = [
-            (
-                attn_slice.q_range,
-                attn_slice.k_ranges,
-                attn_slice.mask_types[-1]
-                if len(attn_slice.mask_types) > 0
-                else AttnMaskType.FULL,  # if empty, this is no use but a placeholder
-            )
-            for attn_slice in host_rank_entry_this_rank.attn_calc_remote_slice_list_hb_domain
-        ]
-
-        return self._make_remote_entry_for_one_stage(
-            slice_tuples=slice_tuples,
-            remote_k_ranges_global_this_stage=host_rank_entry_this_rank.remote_k_ranges_global_hb_domain,
-            host_k_ranges_global_this_rank=host_rank_entry_this_rank.host_k_ranges_global,
-        )
 
     @nvtx.instrument_nvtx
     def _calc_cost_pairs_per_chunk(
@@ -1556,19 +606,6 @@ class DistAttnSolver:
                 len(cost_partitions) == self.overlap_degree
             ), f"{len(cost_partitions)=}, {self.overlap_degree=}"
 
-        # DE-BUG: log vars related to overlap solver I/O
-        # from magi_attention.utils import write_rank
-        # write_rank(
-        #     msg=(
-        #         f"{best_overlap_degree_this_rank=} | {self.overlap_degree=} | \n\n"
-        #         f"{self.overlap_config=} | \n\n"
-        #         f"{len(chunk_costs)=} | {chunk_costs=} | \n\n"
-        #         f"{len(cost_partitions)=} | {cost_partitions=} | \n\n"
-        #         f"{len(solution_dict)=} | {solution_dict=} | \n\n"
-        #     ),
-        #     path="overlap_solver_io.log",
-        # )
-
         return cost_partitions
 
     @nvtx.instrument_nvtx
@@ -1591,15 +628,9 @@ class DistAttnSolver:
                 )
             )
 
-        # DE-BUG: log remote_rank_entry_per_stage_this_rank
-        # from magi_attention.utils import write_rank
-        # write_rank(
-        #     repr(remote_rank_entry_per_stage_this_rank),
-        #     "remote_rank_entry_per_stage_this_rank.log",
-        # )
-
         return remote_rank_entry_per_stage_this_rank
 
+    # TODO delete some logic
     @nvtx.instrument_nvtx
     def _calc_remote_rank_entry_for_one_stage(
         self, cost_partiton: list[int], host_rank_entry_this_rank: HostRankEntry
@@ -1655,7 +686,7 @@ class DistAttnSolver:
             map_slice_q_range_to_k_ranges.items(),
             key=lambda t: t[0].start,  # sort by q_range.start
         )
-        slice_tuples: list[tuple[AttnRange, AttnRanges, AttnMaskType]] = [
+        slice_tuples: list[tuple[AttnRange, AttnRanges, list[AttnMaskType]]] = [
             (q_range, k_ranges, map_slice_q_range_to_masktype[q_range])
             for q_range, k_ranges in q_range_k_ranges_tuples
         ]
@@ -1669,16 +700,15 @@ class DistAttnSolver:
     @nvtx.instrument_nvtx
     def _make_remote_entry_for_one_stage(
         self,
-        slice_tuples: list[tuple[AttnRange, AttnRanges, AttnMaskType]],
+        slice_tuples: list[tuple[AttnRange, AttnRanges, list[AttnMaskType]]],
         remote_k_ranges_global_this_stage: AttnRanges,
         host_k_ranges_global_this_rank: AttnRanges,
     ) -> RemoteRankEntry:
         """Make the remote entry for one stage
-        called in 'self._calc_remote_rank_entry_for_one_stage' for each stage in lb domain
-        and in 'self._init_remote_rank_entry_this_domain' for this hb domain
+        called in 'self._calc_remote_rank_entry_for_one_stage' for each stage
 
         Args:
-            slice_tuples: each tuple contains a q_range and it's corresponding k_ranges and mask type
+            slice_tuples: each tuple contains a q_range and it's corresponding k_ranges and mask types
             remote_k_ranges_global_this_stage: the remote k ranges for this stage
             host_k_ranges_global_this_rank: the host k ranges for this rank
 
@@ -1687,20 +717,18 @@ class DistAttnSolver:
         """
         attn_calc_remote_slice_local_list_this_stage: list[AttnSlice] = []
 
-        for q_range, k_ranges, mask_type in slice_tuples:
+        for q_range, k_ranges, mask_types in slice_tuples:
             k_ranges = remote_k_ranges_global_this_stage.make_ranges_local(
                 k_ranges,
                 is_self_merged=True,
-            ).merge()
+            )
 
-            for k_range in k_ranges:
-                attn_calc_remote_slice_local_list_this_stage.append(
-                    AttnSlice(
-                        q_range=q_range,
-                        k_range=k_range,
-                        mask_type=mask_type,
-                    )
-                )
+            self._merge_ranges_and_masktypes(
+                q_range=q_range,
+                k_ranges=k_ranges,
+                mask_types=mask_types,
+                attn_calc_remote_slice_local_list_this_stage=attn_calc_remote_slice_local_list_this_stage,
+            )
 
         # sanity check
         if magi_attention.is_sanity_check_enable():
@@ -1713,12 +741,88 @@ class DistAttnSolver:
         )
 
     @nvtx.instrument_nvtx
+    def _merge_ranges_and_masktypes(
+        self,
+        q_range: AttnRange,
+        k_ranges: AttnRanges,
+        mask_types: list[AttnMaskType],
+        attn_calc_remote_slice_local_list_this_stage: list[AttnSlice],
+    ):
+        """sort k_ranges and merge with masktype in cases,
+        which q_range is overlaped with multi mask types
+        """
+        # sort k_ranges and masktypes with range start
+        indices = argsort(k_ranges._ranges, key=lambda range: range.start)
+        k_ranges_list = [k_ranges[i] for i in indices]
+        mask_types = [mask_types[i] for i in indices]
+
+        def _calc_new_masktype(
+            old_masktype: AttnMaskType,
+            new_masktype: AttnMaskType,
+        ) -> AttnMaskType | None:
+            """function to merge masktypes when k_range can be merged"""
+            match (old_masktype, new_masktype):
+                case (AttnMaskType.FULL, AttnMaskType.FULL):
+                    return AttnMaskType.FULL
+                case (AttnMaskType.FULL, AttnMaskType.CAUSAL):
+                    return AttnMaskType.CAUSAL
+                case (AttnMaskType.INVCAUSAL, AttnMaskType.FULL):
+                    return AttnMaskType.INVCAUSAL
+                case (AttnMaskType.INVCAUSAL, AttnMaskType.CAUSAL):
+                    return AttnMaskType.BICAUSAL
+                case _:
+                    return None
+
+        # init k_range and masktype
+        k_range_start, k_range_end = k_ranges_list[0].start, k_ranges_list[0].end
+        cur_mask_type = mask_types[0]
+
+        for i in range(1, len(k_ranges)):
+            can_be_merged = False
+            if k_ranges_list[i].start == k_range_end:
+                # calc new masktype when k_range can be merged
+                new_masktype = _calc_new_masktype(cur_mask_type, mask_types[i])
+                # invalid masktype means there is no suitable mask to merge the k_range.
+                if new_masktype is not None:
+                    k_range_end = k_ranges_list[i].end
+                    cur_mask_type = new_masktype
+                    can_be_merged = True
+
+            if not can_be_merged:
+                # add the current k_range to the array and set it as the new value
+                k_range = AttnRange(start=k_range_start, end=k_range_end)
+                attn_calc_remote_slice_local_list_this_stage.append(
+                    AttnSlice(
+                        q_range=q_range,
+                        k_range=k_range,
+                        mask_type=cur_mask_type,
+                    )
+                )
+
+                # set to new value
+                k_range_start, k_range_end = (
+                    k_ranges_list[i].start,
+                    k_ranges_list[i].end,
+                )
+                cur_mask_type = mask_types[i]
+
+        # add the last k_range to the array
+        k_range = AttnRange(start=k_range_start, end=k_range_end)
+        attn_calc_remote_slice_local_list_this_stage.append(
+            AttnSlice(
+                q_range=q_range,
+                k_range=k_range,
+                mask_type=cur_mask_type,
+            )
+        )
+
+    @nvtx.instrument_nvtx
     def _calc_remote_rank_q_range_to_k_ranges_map(
         self,
         attn_calc_remote_slice_list_per_chunk_this_stage: list[list[MultiKAttnSlice]],
         total_q_ranges_boundary_local_this_stage: list[int],
     ) -> tuple[
-        defaultdict[AttnRange, AttnRanges], defaultdict[AttnRange, AttnMaskType]
+        defaultdict[AttnRange, AttnRanges], defaultdict[AttnRange, list[AttnMaskType]]
     ]:
         """Split the slice according to the boundary, and form maps from q_range to k_ranges and masktype.
         called in 'self._calc_remote_rank_entry_for_one_stage'
@@ -1729,8 +833,8 @@ class DistAttnSolver:
             AttnRanges
         )
         map_slice_q_range_to_masktype: defaultdict[
-            AttnRange, AttnMaskType
-        ] = defaultdict(lambda: AttnMaskType.FULL)
+            AttnRange, list[AttnMaskType]
+        ] = defaultdict(list)
 
         for slice in chain(*attn_calc_remote_slice_list_per_chunk_this_stage):
             # find the start and end index in the boundary list
@@ -1755,28 +859,95 @@ class DistAttnSolver:
                 # create the segmented q_range.
                 q_range_this_slice = AttnRange(start=boundary_start, end=boundary_end)
 
-                if slice.mask_types[-1] == AttnMaskType.FULL:
+                if (
+                    slice.mask_types[-1] == AttnMaskType.FULL
+                    and slice.mask_types[0] == AttnMaskType.FULL
+                ):
                     # in the case of full, no need to handle k_ranges.
                     map_slice_q_range_to_k_ranges[q_range_this_slice].extend(
                         slice.k_ranges
                     )
+                    map_slice_q_range_to_masktype[q_range_this_slice].extend(
+                        [AttnMaskType.FULL] * len(slice.k_ranges)
+                    )
                 elif slice.mask_types[-1] == AttnMaskType.CAUSAL:
                     # in the case of causal, the end of the last range in k_ranges may need to be shortened
-                    if magi_attention.is_sanity_check_enable():
-                        assert (
-                            slice_q_range_end == boundary_end
-                        ), "slice_q_range_end should be always equal to boundary_end"
+                    distance_to_slice_end = slice_q_range_end - boundary_end
 
-                    map_slice_q_range_to_k_ranges[q_range_this_slice].extend(
-                        slice.k_ranges
+                    if distance_to_slice_end == 0:
+                        # don't need to shorten k_range
+                        map_slice_q_range_to_k_ranges[q_range_this_slice].extend(
+                            slice.k_ranges
+                        )
+                    else:
+                        map_slice_q_range_to_k_ranges[q_range_this_slice].extend(
+                            slice.k_ranges[:-1]
+                        )
+                        # shorten causal k_range
+                        last_k_range = AttnRange(
+                            start=slice.k_ranges[-1].start,
+                            end=slice.k_ranges[-1].end - distance_to_slice_end,
+                        )
+                        map_slice_q_range_to_k_ranges[q_range_this_slice].append(
+                            last_k_range
+                        )
+
+                    map_slice_q_range_to_masktype[q_range_this_slice].extend(
+                        [AttnMaskType.FULL] * (len(slice.k_ranges) - 1)
+                        + [AttnMaskType.CAUSAL]
                     )
-                    map_slice_q_range_to_masktype[
-                        q_range_this_slice
-                    ] = AttnMaskType.CAUSAL
+                elif slice.mask_types[0] == AttnMaskType.INVCAUSAL:
+                    # in the case of inv_causal, the start of the first range in k_ranges may need to lengthen
+                    distance_to_slice_start = boundary_start - slice_q_range_start
+
+                    if distance_to_slice_start == 0:
+                        # don't need to lengthen k_range
+                        map_slice_q_range_to_k_ranges[q_range_this_slice].extend(
+                            slice.k_ranges
+                        )
+                    else:
+                        # lengthen inv_causal k_range
+                        first_k_range = AttnRange(
+                            start=slice.k_ranges[0].start + distance_to_slice_start,
+                            end=slice.k_ranges[0].end,
+                        )
+                        map_slice_q_range_to_k_ranges[q_range_this_slice].append(
+                            first_k_range
+                        )
+                        map_slice_q_range_to_k_ranges[q_range_this_slice].extend(
+                            slice.k_ranges[1:]
+                        )
+
+                    map_slice_q_range_to_masktype[q_range_this_slice].extend(
+                        [AttnMaskType.INVCAUSAL]
+                        + [AttnMaskType.FULL] * (len(slice.k_ranges) - 1)
+                    )
+                elif slice.mask_types[0] == AttnMaskType.BICAUSAL:
+                    # in case of bicausal, the start and end may both need to change
+                    if magi_attention.is_sanity_check_enable():
+                        assert len(slice.k_ranges) == 1, (
+                            f"when masktype is bi_causal, the length of k_ranges must be 1, "
+                            f"but got {len(slice.k_ranges)=}"
+                        )
+
+                    distance_to_slice_start = boundary_start - slice_q_range_start
+                    distance_to_slice_end = slice_q_range_end - boundary_end
+
+                    bicausal_k_range = AttnRange(
+                        start=slice.k_ranges[0].start + distance_to_slice_start,
+                        end=slice.k_ranges[0].end - distance_to_slice_end,
+                    )
+
+                    map_slice_q_range_to_k_ranges[q_range_this_slice].append(
+                        bicausal_k_range
+                    )
+                    map_slice_q_range_to_masktype[q_range_this_slice].append(
+                        AttnMaskType.BICAUSAL
+                    )
                 else:
                     raise ValueError(
-                        f"Only support 'full' and 'causal' mask, "
-                        f"but get {slice.mask_types[-1]}"
+                        f"Only support 'full', 'causal', 'inv_causal' and 'bi_causal' mask, "
+                        f"but got {slice.mask_types[-1]} and {slice.mask_types[0]}"
                     )
 
         return (
@@ -2194,8 +1365,48 @@ class DistAttnSolver:
             output_split_size_list=output_split_size_list,
             dst_indices_list=dst_indices_list,
             src_index_list=src_index_list,
+            rank=self.cp_rank,
             world_size=self.cp_size,
+            device_mesh=self.cp_mesh,
+            deterministic=self.deterministic,
         )
+
+        # sanity check for group-cast arg per rank
+        # NOTE: we don't need to do sanity check for group-reduce arg per rank
+        # since they are symmetric in dist-attn
+        if magi_attention.is_sanity_check_enable():
+            group_collective_arg_per_rank: list[dict] = [None] * self.cp_size  # type: ignore
+            dist.all_gather_object(
+                group_collective_arg_per_rank,
+                # since some attrs of GroupCollectiveArg like process group
+                # can not be serialized, here we only gather the meta args
+                dict(
+                    input_split_size_list=input_split_size_list,
+                    output_split_size_list=output_split_size_list,
+                    dst_indices_list=dst_indices_list,
+                    src_index_list=src_index_list,
+                ),
+                group=self.cp_group,
+            )
+
+            sanity_check_for_group_cast_meta_args_per_rank(
+                input_split_size_list_per_rank=[
+                    arg["input_split_size_list"]
+                    for arg in group_collective_arg_per_rank
+                ],
+                output_split_size_list_per_rank=[
+                    arg["output_split_size_list"]
+                    for arg in group_collective_arg_per_rank
+                ],
+                dst_indices_list_per_rank=[
+                    arg["dst_indices_list"] for arg in group_collective_arg_per_rank
+                ],
+                src_index_list_per_rank=[
+                    arg["src_index_list"] for arg in group_collective_arg_per_rank
+                ],
+                world_size=self.cp_size,
+                check_nccl_send_recv=True,
+            )
 
         return group_collective_arg
 
@@ -2219,6 +1430,14 @@ class DistAttnSolver:
                     for attn_slice in remote_rank_entry_this_stage_this_rank.attn_calc_remote_slice_local_list
                 )
 
+        # init masktype -> int map
+        masktype_to_idx_map = {
+            AttnMaskType.FULL: 0,
+            AttnMaskType.CAUSAL: 1,
+            AttnMaskType.INVCAUSAL: 2,
+            AttnMaskType.BICAUSAL: 3,
+        }
+
         # ---   build local attn args   --- #
 
         host_slice_local_list = (
@@ -2231,8 +1450,8 @@ class DistAttnSolver:
             k_ranges=AttnRanges.from_ranges(
                 [attn_slice.k_range for attn_slice in host_slice_local_list]  # type: ignore[arg-type]
             ),
-            is_causal_mapping=[
-                attn_slice.mask_type == AttnMaskType.CAUSAL
+            attn_type_map=[
+                masktype_to_idx_map[attn_slice.mask_type]  # type: ignore
                 for attn_slice in host_slice_local_list
             ],
             shard_seqlen_q=self.shard_seqlen_q,
@@ -2256,8 +1475,8 @@ class DistAttnSolver:
                     k_ranges=AttnRanges.from_ranges(
                         [attn_slice.k_range for attn_slice in remote_slice_local_list]  # type: ignore[arg-type]
                     ),
-                    is_causal_mapping=[
-                        attn_slice.mask_type == AttnMaskType.CAUSAL
+                    attn_type_map=[
+                        masktype_to_idx_map[attn_slice.mask_type]  # type: ignore
                         for attn_slice in remote_slice_local_list
                     ],
                     shard_seqlen_q=self.shard_seqlen_q,
@@ -2276,7 +1495,31 @@ class DistAttnSolver:
 
         return attn_calc_meta
 
-    def __repr__(self, title_len: int = 50) -> str:
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, DistAttnSolver):
+            return False
+
+        for key in self.__dict__:
+            self_val = getattr(self, key)
+            other_val = getattr(other, key, object())
+
+            if isinstance(self_val, dist.ProcessGroup) or isinstance(
+                other_val, dist.ProcessGroup
+            ):
+                if not is_same_process_group(self_val, other_val):
+                    return False
+
+            elif isinstance(self_val, DeviceMesh) or isinstance(other_val, DeviceMesh):
+                if not is_same_device_mesh(self_val, other_val):
+                    return False
+
+            else:
+                if self_val != other_val:
+                    return False
+
+        return True
+
+    def __repr__(self, title_len: int = 50) -> str:  # pragma: no cover
         repr_contents = []
 
         repr_summary = self._repr_host_info(
@@ -2302,7 +1545,7 @@ class DistAttnSolver:
 
             repr_contents.append(repr_this_stage)
 
-        # 末尾换行
+        # add separator
         repr_contents.append("\n\n")
 
         return "\n\n".join(repr_contents)
@@ -2318,12 +1561,7 @@ class DistAttnSolver:
 
         host_q_ranges_global = host_rank_entry_this_rank.host_q_ranges_global
         host_k_ranges_global = host_rank_entry_this_rank.host_k_ranges_global
-        remote_k_ranges_global_hb_domain = (
-            host_rank_entry_this_rank.remote_k_ranges_global_hb_domain
-        )
-        remote_k_ranges_global_lb_domain = (
-            host_rank_entry_this_rank.remote_k_ranges_global_lb_domain
-        )
+        remote_k_ranges_global = host_rank_entry_this_rank.remote_k_ranges_global
         attn_calc_slice_global_list = (
             host_rank_entry_this_rank.attn_calc_slice_global_list
         )
@@ -2333,12 +1571,7 @@ class DistAttnSolver:
 
         repr_info.append(f"host_q_ranges_global: {host_q_ranges_global}")
         repr_info.append(f"host_k_ranges_global: {host_k_ranges_global}")
-        repr_info.append(
-            f"remote_k_ranges_global_hb_domain: {remote_k_ranges_global_hb_domain}"
-        )
-        repr_info.append(
-            f"remote_k_ranges_global_lb_domain: {remote_k_ranges_global_lb_domain}"
-        )
+        repr_info.append(f"remote_k_ranges_global: {remote_k_ranges_global}")
         repr_info.append(f"attn_calc_slice_global_list: {attn_calc_slice_global_list}")
         repr_info.append(
             f"attn_calc_host_slice_local_list: {attn_calc_host_slice_local_list}"
@@ -2353,7 +1586,7 @@ class DistAttnSolver:
         remote_rank_entry_per_rank_this_stage: list[RemoteRankEntry],
         title_len: int = 50,
     ) -> str:  # pragma: no cover
-        # 计算每个单元格需要的最大宽度
+        # calculate the max width for each cell
         cell_widths = [[0] * self.cp_size for _ in range(self.cp_size)]
         for send_rank in range(self.cp_size):
             for recv_rank in range(self.cp_size):
@@ -2364,7 +1597,7 @@ class DistAttnSolver:
                 width = max(len(send_str), len(recv_str), len(global_str))
                 cell_widths[send_rank][recv_rank] = width
 
-        # 计算每列的最大宽度
+        # calculate the max width for each column
         col_widths = [
             max(
                 max(cell_widths[row][col] for row in range(self.cp_size)),
@@ -2384,28 +1617,29 @@ class DistAttnSolver:
             for col in range(self.cp_size)
         ]
 
-        # 计算表格的总宽度（考虑到每列分隔符 " | " 以及每行的"row xx |"前缀）
+        # calculate the total width of the table
+        # considering the separators " | " and the "row xx |" prefix
         table_width = (
             sum(col_widths) + 4 * (self.cp_size - 1) + 7
-        )  # 每列间隔宽度4 + row xx | 前缀宽度为7
+        )  # each column separator width is 4 and the prefix width is 7
 
-        # 构建表格
+        # construct table
         repr_info_this_stage = []
 
-        # 添加overlap stage title分割线
+        # add a separator line for each overlap stage
         stage_title = f"  Remote Info for Stage {stage}  "
         repr_info_this_stage.append(
             "\n" + "=" * title_len + stage_title + "=" * title_len + "\n"
         )
 
-        # 添加列标题行（扩展为5行高度）
+        # add a title line for each col (expanded to 5 rows height)
         repr_info_this_stage.append("\n" + "-" * table_width)
 
-        # 第一行：列号
+        # first row: col number
         header_cells = [f"col{j:2d}".center(col_widths[j]) for j in range(self.cp_size)]
         repr_info_this_stage.append("r/c   | " + " | ".join(header_cells) + " |")
 
-        # 第二行：host_k_ranges_global
+        # second row: host_k_ranges_global
         host_cells = [
             f"host_k_ranges_global: {remote_rank_entry_per_rank_this_stage[j].host_k_ranges_global}".ljust(
                 col_widths[j]
@@ -2414,7 +1648,7 @@ class DistAttnSolver:
         ]
         repr_info_this_stage.append("      | " + " | ".join(host_cells) + " |")
 
-        # 第三行：remote_k_ranges_global
+        # third row: remote_k_ranges_global
         remote_cells = [
             f"remote_k_ranges_global: {remote_rank_entry_per_rank_this_stage[j].remote_k_ranges_global}".ljust(
                 col_widths[j]
@@ -2423,7 +1657,7 @@ class DistAttnSolver:
         ]
         repr_info_this_stage.append("      | " + " | ".join(remote_cells) + " |")
 
-        # 第四行：attn_calc_remote_slice_local_list
+        # fourth row: attn_calc_remote_slice_local_list
         remote_slice_cells = [
             "attn_calc_remote_slice_local_list: "
             f"{remote_rank_entry_per_rank_this_stage[j].attn_calc_remote_slice_local_list}".ljust(
@@ -2433,12 +1667,12 @@ class DistAttnSolver:
         ]
         repr_info_this_stage.append("      | " + " | ".join(remote_slice_cells) + " |")
 
-        # 添加分割线
+        # add a separator line
         repr_info_this_stage.append("-" * table_width)
 
-        # 添加每一行
+        # add each row
         for send_rank in range(self.cp_size):
-            # 处理每个单元格的三行内容
+            # add the cell content
             cell_lines = []
             for recv_rank in range(self.cp_size):
                 col_width = col_widths[recv_rank]
@@ -2455,12 +1689,12 @@ class DistAttnSolver:
                 ]
                 cell_lines.append(cell_content)
 
-            # 组装每行的三行内容
+            # concatenate the lines to form the cell
             for line_idx in range(3):
                 prefix = f"row{send_rank:2d} |" if line_idx == 0 else "      |"
                 line = [cell_lines[j][line_idx] for j in range(self.cp_size)]
                 repr_info_this_stage.append(f"{prefix} " + " | ".join(line) + " |")
 
-            repr_info_this_stage.append("-" * table_width)  # 每行后面添加分割线
+            repr_info_this_stage.append("-" * table_width)  # add a separator line
 
         return "\n".join(repr_info_this_stage)

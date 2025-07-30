@@ -21,7 +21,6 @@ import subprocess
 import sys
 import sysconfig
 import tarfile
-import urllib.error
 import urllib.request
 import warnings
 from pathlib import Path
@@ -63,6 +62,8 @@ SKIP_CUDA_BUILD = os.getenv("MAGI_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 FORCE_CXX11_ABI = os.getenv("MAGI_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
 
+# TODO: remove flags to compile with sm80
+# which we do not support for now
 def _write_ninja_file(
     path,
     cflags,
@@ -461,117 +462,60 @@ if not SKIP_CUDA_BUILD:
     # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
+
     repo_dir = Path(this_dir)
+
     cutlass_dir = repo_dir / "magi_attention" / "csrc" / "cutlass"
+
     ffa_dir_abs = repo_dir / "magi_attention" / "csrc" / "flexible_flash_attention"
-    ffa_dir_rel = "magi_attention/csrc/flexible_flash_attention"
+    ffa_dir_rel = ffa_dir_abs.relative_to(repo_dir)
+
+    common_dir = repo_dir / "magi_attention" / "csrc" / "common"
 
     # custom flags
-    DISABLE_SM8x = True
-    DISABLE_LOCAL = True
-    DISABLE_HDIM256 = True
+    DISABLE_HDIM64 = False
     DISABLE_HDIM96 = True
-    DISABLE_FP8 = True
-    DISABLE_PACKGQA = True
-    DISABLE_PAGEDKV = True
-    DISABLE_APPENDKV = True
-    DISABLE_SPLIT = True
+    DISABLE_HDIM128 = False
+    DISABLE_HDIM192 = True
+    DISABLE_HDIM256 = True
     DISABLE_FP16 = False
     DISABLE_BACKWARD = False
     DISABLE_SOFTCAP = False
-    DISABLE_VARLEN = False
     DISABLE_CLUSTER = False
-    DISABLE_HDIM64 = False
-    DISABLE_HDIM128 = False
-    DISABLE_HDIM192 = False
-    ENABLE_VCOLMAJOR = False
 
     feature_args = (
         []
         + (["-DFLASHATTENTION_DISABLE_BACKWARD"] if DISABLE_BACKWARD else [])
-        + (["-DFLASHATTENTION_DISABLE_PAGEDKV"] if DISABLE_PAGEDKV else [])
-        + (["-DFLASHATTENTION_DISABLE_SPLIT"] if DISABLE_SPLIT else [])
-        + (["-DFLASHATTENTION_DISABLE_APPENDKV"] if DISABLE_APPENDKV else [])
-        + (["-DFLASHATTENTION_DISABLE_LOCAL"] if DISABLE_LOCAL else [])
         + (["-DFLASHATTENTION_DISABLE_SOFTCAP"] if DISABLE_SOFTCAP else [])
-        + (["-DFLASHATTENTION_DISABLE_PACKGQA"] if DISABLE_PACKGQA else [])
         + (["-DFLASHATTENTION_DISABLE_FP16"] if DISABLE_FP16 else [])
-        + (["-DFLASHATTENTION_DISABLE_FP8"] if DISABLE_FP8 else [])
-        + (["-DFLASHATTENTION_DISABLE_VARLEN"] if DISABLE_VARLEN else [])
         + (["-DFLASHATTENTION_DISABLE_CLUSTER"] if DISABLE_CLUSTER else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM64"] if DISABLE_HDIM64 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM96"] if DISABLE_HDIM96 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM192"] if DISABLE_HDIM192 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
-        + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
-        + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
     )
 
-    DTYPE_FWD_SM80 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
-    DTYPE_FWD_SM90 = (
-        ["bf16"]
-        + (["fp16"] if not DISABLE_FP16 else [])
-        + (["e4m3"] if not DISABLE_FP8 else [])
-    )
-    DTYPE_BWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
-    HEAD_DIMENSIONS_BWD = (
-        []
-        + ([64] if not DISABLE_HDIM64 else [])
-        + ([96] if not DISABLE_HDIM96 else [])
-        + ([128] if not DISABLE_HDIM128 else [])
-        + ([192] if not DISABLE_HDIM192 else [])
-        + ([256] if not DISABLE_HDIM256 else [])
-    )
-    HEAD_DIMENSIONS_FWD = ["all", "diff"]
-    HEAD_DIMENSIONS_FWD_SM80 = HEAD_DIMENSIONS_BWD
-    SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
-    PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
+    DTYPE = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
+    HEAD_DIMENSIONS = ["all"]
     SOFTCAP = [""] + (["_softcap"] if not DISABLE_SOFTCAP else [])
-    SOFTCAP_ALL = [""] if DISABLE_SOFTCAP else ["_softcapall"]
-    PACKGQA = [""] + (["_packgqa"] if not DISABLE_PACKGQA else [])
-    # We already always hard-code PackGQA=true for Sm8x
-    sources_fwd_sm80 = [
-        f"{ffa_dir_rel}/instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}_sm80.cu"
-        for hdim, dtype, split, paged, softcap in itertools.product(
-            HEAD_DIMENSIONS_FWD_SM80, DTYPE_FWD_SM80, SPLIT, PAGEDKV, SOFTCAP_ALL
-        )
-    ]
-    # We already always hard-code PackGQA=true for Sm9x if PagedKV or Split
     sources_fwd_sm90 = [
-        f"{ffa_dir_rel}/instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
-        for hdim, dtype, split, paged, softcap, packgqa in itertools.product(
-            HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA
-        )
-        if not (packgqa and (paged or split))
-    ]
-    sources_bwd_sm80 = [
-        f"{ffa_dir_rel}/instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm80.cu"
-        for hdim, dtype, softcap in itertools.product(
-            HEAD_DIMENSIONS_BWD, DTYPE_BWD, SOFTCAP
-        )
+        f"{ffa_dir_rel}/instantiations/flash_fwd_hdim{hdim}_{dtype}{softcap}_sm90.cu"
+        for hdim, dtype, softcap in itertools.product(HEAD_DIMENSIONS, DTYPE, SOFTCAP)
     ]
     sources_bwd_sm90 = [
         f"{ffa_dir_rel}/instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm90.cu"
-        for hdim, dtype, softcap in itertools.product(
-            HEAD_DIMENSIONS_BWD, DTYPE_BWD, SOFTCAP_ALL
-        )
+        for hdim, dtype, softcap in itertools.product(HEAD_DIMENSIONS, DTYPE, SOFTCAP)
     ]
     if DISABLE_BACKWARD:
         sources_bwd_sm90 = []
-        sources_bwd_sm80 = []
-    sources = (
-        [f"{ffa_dir_rel}/flash_api.cpp"]
-        + (sources_fwd_sm80 if not DISABLE_SM8x else [])
-        + sources_fwd_sm90
-        + (sources_bwd_sm80 if not DISABLE_SM8x else [])
-        + sources_bwd_sm90
-    )
-    if not DISABLE_SPLIT:
-        sources += [f"{ffa_dir_rel}/flash_fwd_combine.cu"]
-    sources += [f"{ffa_dir_rel}/flash_prepare_scheduler.cu"]
+    sources = [f"{ffa_dir_rel}/flash_api.cpp"] + sources_fwd_sm90 + sources_bwd_sm90
+    sources += [f"{ffa_dir_rel}/fast_zero_fill.cu"]
+    sources += [f"{ffa_dir_rel}/unique_consecutive_pairs.cu"]
     nvcc_flags = [
         "-O3",
+        "-Xptxas",
+        "-v",
         "-std=c++17",
         "--ftemplate-backtrace-limit=0",  # To debug template code
         "--use_fast_math",
@@ -593,26 +537,32 @@ if not SKIP_CUDA_BUILD:
             ]
         )
     include_dirs = [
+        common_dir,
         ffa_dir_abs,
         cutlass_dir / "include",
     ]
+
+    extra_compile_args = {
+        "cxx": ["-O3", "-std=c++17"] + feature_args,
+        "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
+    }
 
     ext_modules.append(
         CUDAExtension(
             name="flexible_flash_attention_cuda",
             sources=sources,
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"] + feature_args,
-                "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
-            },
+            extra_compile_args=extra_compile_args,
             include_dirs=include_dirs,
         )
     )
 
+package_data = {
+    "magi_attention": ["*.pyi", "**/*.pyi"],
+}
+
 
 setup(
     name="magi_attention",
-    version="1.0.0",
     packages=find_packages(
         exclude=(
             "build",
@@ -623,8 +573,10 @@ setup(
             "assets",
         )
     ),
+    package_data=package_data,
+    include_package_data=True,
     py_modules=["magi_attention"],
-    description="A super fast distributed attention solver",
+    description="A Distributed Attention Towards Linear Scalability for Ultra-Long Context, Heterogeneous Mask Training",
     long_description=long_description,
     long_description_content_type="text/markdown",
     classifiers=[

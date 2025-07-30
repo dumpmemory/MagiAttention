@@ -13,9 +13,12 @@
 # limitations under the License.
 
 import itertools
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
 from magi_attention.common import AttnRanges
 from magi_attention.common.enum import AttnMaskType, AttnRole
@@ -29,49 +32,25 @@ from magi_attention.meta import (
 from magi_attention.meta.collection import DispatchMeta
 from magi_attention.meta.collection.calc_meta import AttnArg
 from magi_attention.meta.solver.dist_attn_solver import DistAttnSolver
-from magi_attention.utils import is_list_value_all, wrap_to_list
+from magi_attention.utils import is_list_value_all, is_same_process_group, wrap_to_list
 
 
-# @dataclass(frozen=True)
+@dataclass(frozen=True)
 class DistAttnRuntimeKey:
-    def __init__(
-        self,
-        cp_group: dist.ProcessGroup,
-        pad_size: int,
-        head_dim: int,
-        q_ranges: AttnRanges,
-        k_ranges: AttnRanges,
-        attn_mask_type: list[AttnMaskType],
-        total_seqlen_q: int,
-        total_seqlen_k: int,
-        dist_attn_config: DistAttnConfig,
-    ):
-        self.cp_group = cp_group
-        self.pad_size = pad_size
-        self.head_dim = head_dim
-        self.q_ranges = q_ranges
-        self.k_ranges = k_ranges
-        self.attn_mask_type = attn_mask_type
-        self.total_seqlen_q = total_seqlen_q
-        self.total_seqlen_k = total_seqlen_k
-        self.dist_attn_config = dist_attn_config
+    q_ranges: AttnRanges
+    k_ranges: AttnRanges
+    attn_mask_type: list[AttnMaskType]
+    total_seqlen_q: int
+    total_seqlen_k: int
+    pad_size: int
+    chunk_size: int
+    cp_group: dist.ProcessGroup
+    cp_mesh: DeviceMesh | None
+    dist_attn_config: DistAttnConfig
 
-    def __hash__(self):
-        mask_tuple = tuple(self.attn_mask_type)
-
-        return hash(
-            (
-                self.cp_group,
-                self.pad_size,
-                self.head_dim,
-                self.q_ranges,
-                self.k_ranges,
-                mask_tuple,
-                self.total_seqlen_q,
-                self.total_seqlen_k,
-                self.dist_attn_config,
-            )
-        )
+    def __post_init__(self):
+        # make attn_mask_type a tuple to be hashable
+        object.__setattr__(self, "attn_mask_type", tuple(self.attn_mask_type))
 
 
 class DistAttnRuntimeMgr:
@@ -197,7 +176,7 @@ class DistAttnRuntimeMgr:
                     host_global_perm_sorted_q_ranges
                 ),
                 k_ranges=host_global_unperm_xattn_k_ranges,
-                is_causal_mapping=[False] * len(host_global_perm_sorted_q_ranges),
+                attn_type_map=[0] * len(host_global_perm_sorted_q_ranges),
                 shard_seqlen_q=host_global_perm_sorted_q_ranges.total_seqlen,
             )
             return attn_arg
@@ -229,7 +208,7 @@ class DistAttnRuntimeMgr:
         attn_arg = AttnArg(
             q_ranges=total_global_perm_sorted_q_ranges,
             k_ranges=total_global_unperm_xattn_k_ranges,
-            is_causal_mapping=[False] * len(total_global_perm_sorted_q_ranges),
+            attn_type_map=[0] * len(total_global_perm_sorted_q_ranges),
             shard_seqlen_q=total_global_perm_sorted_q_ranges.total_seqlen,
         )
         return attn_arg
@@ -256,6 +235,38 @@ class DistAttnRuntimeMgr:
         else:
             raise ValueError(f"Invalid attn role: {attn_role}")
 
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, DistAttnRuntimeMgr):
+            return False
+
+        return (
+            self.q_dispatch_meta,
+            self.k_dispatch_meta,
+            self.chunk_size,
+            self.dist_attn_config,
+            self.attn_solver,
+            self.dist_attn_runtime,
+            self.ref_q_ranges,
+            self.ref_k_ranges,
+            self.is_same_source,
+            self.is_q_permutable,
+            self.is_k_permutable,
+        ) == (
+            other.q_dispatch_meta,
+            other.k_dispatch_meta,
+            other.chunk_size,
+            other.dist_attn_config,
+            other.attn_solver,
+            other.dist_attn_runtime,
+            other.ref_q_ranges,
+            other.ref_k_ranges,
+            other.is_same_source,
+            other.is_q_permutable,
+            other.is_k_permutable,
+        ) and is_same_process_group(
+            self.cp_group, other.cp_group
+        )
+
 
 def init_dist_attn_runtime_mgr(
     q_ranges: AttnRanges,
@@ -269,6 +280,7 @@ def init_dist_attn_runtime_mgr(
     is_q_permutable: bool,
     is_k_permutable: bool,
     dist_attn_config: DistAttnConfig = DistAttnConfig(),
+    cp_mesh: DeviceMesh | None = None,
 ) -> DistAttnRuntimeMgr:
     """
 
@@ -299,6 +311,8 @@ def init_dist_attn_runtime_mgr(
                     b) q is unpermutable cuz of self-attn, but k is permutable even in a different way
 
         dist_attn_config (DistAttnConfig): dist attn config
+
+        cp_mesh (DeviceMesh): process mesh, only support 1D or 2D mesh for now.
 
     Returns:
         DistAttnRuntimeMgr: dist attn runtime mgr
@@ -355,7 +369,6 @@ def init_dist_attn_runtime_mgr(
         is_same_source=is_same_source,
         is_q_permutable=is_q_permutable,
         is_k_permutable=is_k_permutable,
-        high_bandwith_domain_size=dist_attn_config.high_bandwith_domain_size,
     )
 
     comm_meta, attn_calc_meta, attn_solver = calc_attn_meta_from_dispatch_meta(
@@ -363,8 +376,8 @@ def init_dist_attn_runtime_mgr(
         dispatch_meta_k=k_dispatch_meta,
         bucket_per_rank=attn_buckets,
         cp_group=cp_group,
-        high_bandwith_domain_size=dist_attn_config.high_bandwith_domain_size,
         overlap_config=dist_attn_config.overlap_config,
+        cp_mesh=cp_mesh,
     )
 
     dist_attn_runtime = DistFlashAttnRuntime(
@@ -372,7 +385,6 @@ def init_dist_attn_runtime_mgr(
         calc_meta=attn_calc_meta,
         cp_group_kv=cp_group,
         cp_group_dkv=cp_group,  # TODO: support interface to set distinct cp group for dkv
-        deterministic=dist_attn_config.deterministic,
     )
 
     return DistAttnRuntimeMgr(

@@ -34,9 +34,9 @@ class AttnMaskType(Enum):
     """The enum used to specify the unit type of attention mask we support"""
 
     FULL = "full"
-    CAUSAL = "causal"  # NOTE: The causal mask aligns to the bottom-right corner if it's not square
-    BICAUSAL = "bicausal"
-    INVCAUSAL = "invcausal"
+    CAUSAL = "causal"
+    BICAUSAL = "bi_causal"
+    INVCAUSAL = "inv_causal"
 
 
 class AttnOverlapMode(Enum):
@@ -55,6 +55,10 @@ class DispatchAlgType(Enum):
     MIN_HEAP = "min_heap"
     TOPP_HEAP = "topp_heap"
     BACKTRACKING_PRUNING = "backtracing_pruning"
+    RANDOM_SELECT = "random_select"
+    SEQUENTIAL_SELECT = "sequential_select"
+    BATCH_TOPP_HEAP = "batch_topp_heap"
+    SORTED_SEQUENTIAL_SELECT = "sorted_sequential_select"
 
 
 class OverlapAlgType(Enum):

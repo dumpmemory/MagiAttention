@@ -21,10 +21,19 @@ import torch
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
+NAME = "name"
+
+SKIP_WORLD_SIZE = "skip_world_size"
+
+PROFILE_ONLY = "profile_only"
+
+INTERFACE = "interface"
+
 DEVICE_TYPE = (
     "cuda" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else "cpu"
 )
-PG_BACKEND = "nccl" if DEVICE_TYPE == "cuda" else "gloo"
+
+PG_DEFAULT_BACKEND = "nccl" if DEVICE_TYPE == "cuda" else "gloo"
 
 NUM_DEVICES = 4
 
@@ -39,7 +48,6 @@ if os.environ.get("MAGI_ATTENTION_UNITEST_PROFILE_MODE", "0") != "1":
     os.environ["MAGI_ATTENTION_SANITY_CHECK"] = "1"
 
 
-# TODO: add process group initialization and property
 class DistTestBase(MultiProcessTestCase):
     @property
     def seed(self) -> int:
@@ -51,7 +59,7 @@ class DistTestBase(MultiProcessTestCase):
 
     @property
     def backend(self) -> str:
-        return PG_BACKEND
+        return PG_DEFAULT_BACKEND
 
     def init_pg(self) -> None:
         if "nccl" in self.backend and torch.cuda.device_count() < self.world_size:
@@ -59,7 +67,12 @@ class DistTestBase(MultiProcessTestCase):
                 f"nccl backend requires {self.world_size} GPUs, but only {torch.cuda.device_count()} are available"
             )
 
-        if self.backend not in ["nccl", "gloo", "mpi", "cpu:gloo,cuda:nccl"]:
+        if self.backend not in [
+            "nccl",
+            "gloo",
+            "mpi",
+            "cpu:gloo,cuda:nccl",
+        ]:
             raise RuntimeError(f"Backend {self.backend} not supported!")
 
         dist.init_process_group(
