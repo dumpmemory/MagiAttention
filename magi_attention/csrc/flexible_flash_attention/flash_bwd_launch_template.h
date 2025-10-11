@@ -70,25 +70,26 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
                                                          /*Clear_dQ=*/false,
                                                          /*Clear_dK=*/false,
                                                          /*Clear_dV=*/false>;
-  typename PreprocessKernel::Arguments preprocess_args{
-      static_cast<Element const*>(params.o_ptr),
-      {params.total_q, params.d, params.h_qo}, // shape_O
-      {params.o_row_stride, _1{}, params.o_head_stride}, // stride_O
-      static_cast<Element const*>(params.do_ptr),
-      {params.do_row_stride, _1{}, params.do_head_stride}, // stride_dO
-      static_cast<float*>(params.dsoftmax_sum),
-      {params.max_seqlen_q_rounded, params.h_qo, params.b}, // shape_dPsum
-      {_1{}, params.max_seqlen_q_rounded, params.h_qo * params.max_seqlen_q_rounded}, // stride_dPsum
-      {params.total_q, params.h_qo}, // shape_LSE
-      static_cast<float*>(params.softmax_lse_ptr),
-      {params.h_qo, _1{}}, // stride_LSE
-      static_cast<float*>(params.softmax_lse_log2_ptr),
-      {_1{}, params.max_seqlen_q_rounded, params.h_qo * params.max_seqlen_q_rounded}, // stride_LSE_log2
-      params.q_ranges,
-      params.k_ranges};
+  typename PreprocessKernel::Arguments preprocess_args{static_cast<Element const*>(params.o_ptr),
+                                                       {params.total_q, params.d, params.h_qo}, // shape_O
+                                                       {params.o_row_stride, _1{}, params.o_head_stride}, // stride_O
+                                                       static_cast<Element const*>(params.do_ptr),
+                                                       {params.do_row_stride, _1{}, params.do_head_stride}, // stride_dO
+                                                       static_cast<float*>(params.dsoftmax_sum),
+                                                       {_4{}, params.total_q_rounded, params.h_qo}, // shape_dPsum
+                                                       {_1{}, _4{}, params.total_q_rounded * 4}, // stride_dPsum
+                                                       {params.total_q, params.h_qo}, // shape_LSE
+                                                       static_cast<float*>(params.softmax_lse_ptr),
+                                                       {params.h_qo, _1{}}, // stride_LSE
+                                                       static_cast<float*>(params.softmax_lse_log2_ptr),
+                                                       {_1{}, _4{}, params.total_q_rounded * 4}, // stride_LSE_log2
+                                                       params.q_ranges,
+                                                       params.k_ranges,
+                                                       params.total_q,
+                                                       params.total_q_rounded};
   typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
-  int num_m_block = cute::ceil_div(params.max_seqlen_q, kBlockM);
-  dim3 grid_m(params.b, num_m_block, params.h_qo);
+  int num_m_block = cute::ceil_div(params.total_q_rounded, kBlockM);
+  dim3 grid_m(1, num_m_block, params.h_qo);
   cutlass::kernel_launch<PreprocessKernel>(grid_m,
                                            PreprocessKernel::MaxThreadsPerBlock,
                                            PreprocessKernel::SharedStorageSize,
@@ -138,32 +139,31 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
   using AttnKernel = flash::enable_sm90_or_later<
       flash::FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler, RangeMerge>>;
 
-  typename CollectiveMainloop::Arguments mainloop_args{
-      static_cast<Element const*>(params.q_ptr),
-      {params.total_q, params.d, params.h_qo}, // shape_Q
-      {params.q_row_stride, _1{}, params.q_head_stride}, // stride_Q
-      static_cast<Element const*>(params.k_ptr),
-      {params.total_k, params.d, params.h_kv}, // shape_K
-      {params.k_row_stride, _1{}, params.k_head_stride}, // stride_K
-      static_cast<Element const*>(params.v_ptr),
-      {params.v_row_stride, _1{}, params.v_head_stride}, // stride_V
-      static_cast<Element const*>(params.do_ptr),
-      {params.do_row_stride, _1{}, params.do_head_stride}, // stride_dO
-      static_cast<ElementAccum*>(params.dq_ptr),
-      {params.total_q, params.d, params.h_qo}, // shape_dQ
-      {params.dq_row_stride, _1{}, params.dq_head_stride}, // stride_dQ
-      static_cast<float*>(params.softmax_lse_log2_ptr),
-      {params.max_seqlen_q_rounded, params.h_qo, params.b}, // shape_LSE
-      {_1{}, params.max_seqlen_q_rounded, params.h_qo * params.max_seqlen_q_rounded}, // stride_LSE_log2
-      static_cast<float*>(params.dsoftmax_sum),
-      {_1{}, params.max_seqlen_q_rounded, params.h_qo * params.max_seqlen_q_rounded}, // stride_dPsum
-      params.scale_softmax,
-      params.softcap,
-      params.q_ranges,
-      params.k_ranges,
-      params.dq_determin_conflict_state,
-      params.dq_determin_range_locks,
-      params.attn_type_map};
+  typename CollectiveMainloop::Arguments mainloop_args{static_cast<Element const*>(params.q_ptr),
+                                                       {params.total_q, params.d, params.h_qo}, // shape_Q
+                                                       {params.q_row_stride, _1{}, params.q_head_stride}, // stride_Q
+                                                       static_cast<Element const*>(params.k_ptr),
+                                                       {params.total_k, params.d, params.h_kv}, // shape_K
+                                                       {params.k_row_stride, _1{}, params.k_head_stride}, // stride_K
+                                                       static_cast<Element const*>(params.v_ptr),
+                                                       {params.v_row_stride, _1{}, params.v_head_stride}, // stride_V
+                                                       static_cast<Element const*>(params.do_ptr),
+                                                       {params.do_row_stride, _1{}, params.do_head_stride}, // stride_dO
+                                                       static_cast<ElementAccum*>(params.dq_ptr),
+                                                       {params.total_q, params.d, params.h_qo}, // shape_dQ
+                                                       {params.dq_row_stride, _1{}, params.dq_head_stride}, // stride_dQ
+                                                       static_cast<float*>(params.softmax_lse_log2_ptr),
+                                                       {_4{}, params.total_q_rounded, params.h_qo}, // shape_LSE
+                                                       {_1{}, _4{}, params.total_q_rounded * 4}, // stride_LSE_log2
+                                                       static_cast<float*>(params.dsoftmax_sum),
+                                                       {_1{}, _4{}, params.total_q_rounded * 4}, // stride_dPsum
+                                                       params.scale_softmax,
+                                                       params.softcap,
+                                                       params.q_ranges,
+                                                       params.k_ranges,
+                                                       params.dq_determin_conflict_state,
+                                                       params.dq_determin_range_locks,
+                                                       params.attn_type_map};
   // The case work with GQA is ugly but idk how to fix it.
   typename CollectiveEpilogue::Arguments epilogue_args{
       static_cast<typename CollectiveEpilogue::Element*>(params.dk_ptr),
@@ -178,8 +178,6 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
       params.determin_range_locks,
   };
 
-  int num_blocks_n = cutlass::ceil_div(params.max_seqlen_k, get<1>(TileShape_MNK{}));
-  num_blocks_n = cutlass::round_up(num_blocks_n, size<1>(ClusterShape{}));
   typename flash::TileSchedulerArguments scheduler_args{/*num_heads*/ params.h_qo,
                                                         /*num_batches*/ params.merge_batch_size,
                                                         /*tile_count_semaphore*/ params.tile_count_semaphore,
