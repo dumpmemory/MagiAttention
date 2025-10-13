@@ -124,9 +124,21 @@ class DistAttnRuntimeMgr:
         return k_or_v
 
     def calc_attn(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        softmax_scale: float | None = None,
+        softcap: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return dist_attn_func(q, k, v, self.dist_attn_runtime)
+        return dist_attn_func(
+            q=q,
+            k=k,
+            v=v,
+            dist_attn_runtime=self.dist_attn_runtime,
+            softmax_scale=softmax_scale,
+            softcap=softcap,
+        )
 
     def get_xattn_args(
         self,
@@ -272,13 +284,16 @@ class DistAttnRuntimeMgr:
 
 
 class DistAttnRuntimeDict(OrderedDict):
-    """A fixed-length dictionary that evicts the least recently used item (LRU policy) when capacity is exceeded"""
+    """
+    A fixed-length ordered dictionary to map DistAttnRuntimeKey to DistAttnRuntimeMgr
+    which evicts the least recently used item (LRU policy) when capacity is exceeded
+    """
 
     def __init__(self, max_size: int, *args, **kwargs):
         self.max_size = max_size
         super().__init__(*args, **kwargs)
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: DistAttnRuntimeKey, value: DistAttnRuntimeMgr):
         # If key exists, delete it first (to ensure it moves to end)
         if key in self:
             del self[key]
@@ -288,7 +303,7 @@ class DistAttnRuntimeDict(OrderedDict):
         # Insert new key-value pair (automatically added to end)
         super().__setitem__(key, value)
 
-    def get(self, key, default=None):
+    def get(self, key: DistAttnRuntimeKey, default=None) -> DistAttnRuntimeMgr | None:
         # Override get method to move accessed items to end (marking as recently used)
         if key in self:
             value = super().__getitem__(key)
@@ -297,7 +312,7 @@ class DistAttnRuntimeDict(OrderedDict):
             return value
         return default
 
-    def get_most_recent_key(self):
+    def get_most_recent_key(self) -> DistAttnRuntimeKey | None:
         """
         Gets and returns the most recently added or accessed key.
         If the dictionary is empty, returns None.

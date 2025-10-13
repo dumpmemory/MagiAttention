@@ -25,7 +25,6 @@ from magi_attention.config import DistAttnConfig
 from magi_attention.dist_attn_runtime_mgr import (
     DistAttnRuntimeDict,
     DistAttnRuntimeKey,
-    DistAttnRuntimeMgr,
     init_dist_attn_runtime_key,
     init_dist_attn_runtime_mgr,
 )
@@ -66,7 +65,7 @@ def magi_attn_varlen_key(
         cu_seqlens_q (torch.Tensor): Cumulative sequence lengths for queries.
         cu_seqlens_k (torch.Tensor): Cumulative sequence lengths for keys.
 
-        pad_size (int): the size to pad along seq_dim. The seq_len need to be divisable by chunk_size * cp_size,
+        pad_size (int): the size to pad along seq_dim. The seq_len need to be divisable by ``chunk_size * cp_size``.
         chunk_size (int): chunk size to chunk the input tensor x along the seqlen dim for dispatch
             to control the granularity of computation load-balance.
 
@@ -74,8 +73,8 @@ def magi_attn_varlen_key(
             **NOTE**: for process group, we only support nccl backend for now,
             and for device mesh, we only support 1D or 2D mesh for now.
 
-        causal (bool, optional): if True, all attn_mask_type is CAUSAL. else, determine masktype with ``window_size``.
-            Defaults to False.
+        causal (bool, optional): if ``True``, all mask types are set to ``CAUSAL``,
+            otherwise, determine the mask types by ``window_size``. Defaults to ``False``.
         window_size (tuple[int, int], optional): window_size of sliding window mask
             which represents ``[window_size_left, window_size_right]``. The parameter is effective only
             when ``causal`` is ``False``; when ``causal`` is ``True``, it is required to be ``(-1, -1)``.
@@ -195,7 +194,7 @@ def magi_attn_varlen_dispatch(
         cu_seqlens_q (torch.Tensor): Cumulative sequence lengths for queries.
         cu_seqlens_k (torch.Tensor): Cumulative sequence lengths for keys.
 
-        pad_size (int): the size to pad along seq_dim. The seq_len need to be divisable by chunk_size * cp_size,
+        pad_size (int): the size to pad along seq_dim. The seq_len need to be divisable by ``chunk_size * cp_size``.
         chunk_size (int): chunk size to chunk the input tensor x along the seqlen dim for dispatch
             to control the granularity of computation load-balance.
 
@@ -203,8 +202,8 @@ def magi_attn_varlen_dispatch(
             **NOTE**: for process group, we only support nccl backend for now,
             and for device mesh, we only support 1D or 2D mesh for now.
 
-        causal (bool, optional): if True, all attn_mask_type is CAUSAL. else, determine masktype with ``window_size``.
-            Defaults to False.
+        causal (bool, optional): if ``True``, all mask types are set to ``CAUSAL``,
+            otherwise, determine the mask types by ``window_size``. Defaults to ``False``.
         window_size (tuple[int, int], optional): window_size of sliding window mask
             which represents ``[window_size_left, window_size_right]``. The parameter is effective only
             when ``causal`` is ``False``; when ``causal`` is ``True``, it is required to be ``(-1, -1)``.
@@ -317,7 +316,7 @@ def magi_attn_flex_key(
         total_seqlen_q (int): the total seqlen of query
         total_seqlen_k (int): the total seqlen of key
 
-        pad_size (int): the size to pad along seq_dim. The seq_len need to be divisable by chunk_size * cp_size,
+        pad_size (int): the size to pad along seq_dim. The seq_len need to be divisable by ``chunk_size * cp_size``.
         chunk_size (int): chunk size to chunk the input tensor x along the seqlen dim for dispatch
             to control the granularity of computation load-balance.
 
@@ -528,7 +527,7 @@ def magi_attn_flex_dispatch(
         total_seqlen_q (int): the total seqlen of query
         total_seqlen_k (int): the total seqlen of key
 
-        pad_size (int): the size to pad along seq_dim. The seq_len need to be divisable by chunk_size * cp_size,
+        pad_size (int): the size to pad along seq_dim. The seq_len need to be divisable by ``chunk_size * cp_size``.
         chunk_size (int): chunk size to chunk the input tensor x along the seqlen dim for dispatch
             to control the granularity of computation load-balance.
 
@@ -708,6 +707,8 @@ def calc_attn(
     k: torch.Tensor,
     v: torch.Tensor,
     key: DistAttnRuntimeKey,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply attention computation.
@@ -720,17 +721,21 @@ def calc_attn(
             as one argument for many other magi_attention APIs,
             about which the users may have no bother to care.
 
+        softmax_scale (float, optional): softmax scale.
+            Defaults to ``None`` to use: ``1/sqrt(head_dim)``.
+        softcap (float, optional): softcap. Defaults to ``0.0``.
+
     Returns:
         tuple[torch.Tensor, torch.Tensor]:
             - out (torch.Tensor): local output tensor.
             - lse (torch.Tensor): local log-sum-exp tensor.
 
     Shapes:
-        q: [num_tokens_q_local, num_heads_q, head_dim]
-        k: [num_tokens_kv_local, num_heads_kv, head_dim]
-        v: [num_tokens_kv_local, num_heads_kv, head_dim]
-        out: [num_tokens_q_local, num_heads_q, head_dim]
-        lse: [num_tokens_q_local, num_heads_q]
+        - q: [num_tokens_q_local, num_heads_q, head_dim]
+        - k: [num_tokens_kv_local, num_heads_kv, head_dim]
+        - v: [num_tokens_kv_local, num_heads_kv, head_dim]
+        - out: [num_tokens_q_local, num_heads_q, head_dim]
+        - lse: [num_tokens_q_local, num_heads_q]
 
     Raises:
         ValueError: If the provided ``key`` does not exist in ``dist_attn_runtime_dict``.
@@ -739,7 +744,13 @@ def calc_attn(
     if mgr is None:
         raise ValueError("The dist attn runtime key does not exist!")
 
-    return mgr.calc_attn(q, k, v)
+    return mgr.calc_attn(
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=softmax_scale,
+        softcap=softcap,
+    )
 
 
 def get_position_ids(key: DistAttnRuntimeKey) -> torch.Tensor:
@@ -757,7 +768,7 @@ def get_position_ids(key: DistAttnRuntimeKey) -> torch.Tensor:
     Raises:
         ValueError: If the provided ``key`` does not exist in ``dist_attn_runtime_dict``.
     """
-    mgr: DistAttnRuntimeMgr = dist_attn_runtime_dict.get(key)
+    mgr = dist_attn_runtime_dict.get(key)
     if mgr is None:
         raise ValueError("The dist attn runtime key does not exist!")
 
@@ -775,7 +786,12 @@ def get_most_recent_key() -> DistAttnRuntimeKey:
     Returns:
         DistAttnRuntimeKey: the most recent inserted key.
     """
-    return dist_attn_runtime_dict.get_most_recent_key()
+
+    key = dist_attn_runtime_dict.get_most_recent_key()
+    if key is None:
+        raise ValueError("The dist attn runtime dict is empty!")
+
+    return key
 
 
 def make_varlen_key_for_new_mask_after_dispatch(
@@ -802,7 +818,7 @@ def make_varlen_key_for_new_mask_after_dispatch(
         cu_seqlens_q (torch.Tensor): Cumulative sequence lengths for queries.
         cu_seqlens_k (torch.Tensor): Cumulative sequence lengths for keys.
         key_for_dispatch (DistAttnRuntimeKey): the key used for dispatch
-        causal (bool, optional): whether the varlen attention mask is causal. Defaults to False.
+        causal (bool, optional): whether the varlen attention mask is causal. Defaults to ``False``.
         window_size (tuple[int, int], optional): window_size of sliding window mask
             which represents ``[window_size_left, window_size_right]``. The parameter is effective only
             when ``causal`` is ``False``; when ``causal`` is ``True``, it is required to be ``(-1, -1)``.
@@ -1031,11 +1047,6 @@ def make_flex_key_for_new_mask_after_dispatch(
         >>> total_out1 = undispatch(local_out1, key_for_dispatch)
         >>> total_out2 = undispatch(local_out2, new_key_for_swa_mask)
     """
-    # validate key_for_dispatch
-    assert (
-        key_for_dispatch in dist_attn_runtime_dict.keys()
-    ), "The key_for_dispatch does not exist!"
-
     # validate and transform attn_mask_type
     attn_mask_type = wrap_to_list(attn_mask_type, broadcast_to_length=q_ranges.size)
     assert is_list_type_all(attn_mask_type, (str, AttnMaskType)), (
@@ -1065,7 +1076,9 @@ def make_flex_key_for_new_mask_after_dispatch(
     )
 
     # extract the common attributes from the mgr for dispatch
-    mgr: DistAttnRuntimeMgr = dist_attn_runtime_dict[key_for_dispatch]
+    mgr = dist_attn_runtime_dict.get(key_for_dispatch)
+    if mgr is None:
+        raise ValueError("The dist attn runtime key for dispatch does not exist!")
     ref_dispatch_meta_q = mgr.dispatch_meta_q
     ref_dispatch_meta_k = mgr.dispatch_meta_k
     is_same_source = mgr.is_same_source
