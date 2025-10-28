@@ -81,6 +81,8 @@ def merge_ranges(
         inner_ranges (torch.Tensor): A tensor of shape `[num_ranges, 2]`,
             where each row is paired with the corresponding row in
             `outer_ranges`, representing the inner ranges (e.g., K-block ranges).
+        attn_type_map (torch.Tensor): A tensor of shape `[num_ranges]`,
+            representing the attn_type of each range.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -108,7 +110,7 @@ def merge_ranges(
         ...     sorted_attn_type_map,
         ...     range_map,
         ...     unique_count,
-        ... ) = merge_ranges(outer_ranges, inner_ranges)
+        ... ) = merge_ranges(outer_ranges, inner_ranges, attn_type_map)
         >>> print("Unique Merged Outer Ranges:", merge_outer_ranges)
         Unique Merged Outer Ranges:
          tensor([[10, 20],
@@ -196,6 +198,7 @@ def _flex_flash_attn_forward_compilable(
     out_type: torch.dtype | None,
     deterministic: bool,
     sm_margin: int,
+    profile_mode: bool,
 ) -> None:
     """torch.ops.flex_flash_attn._flex_flash_attn_forward_compilable"""
     q, k, v, q_ranges, k_ranges = [
@@ -234,6 +237,7 @@ def _flex_flash_attn_forward_compilable(
         out_type,
         deterministic,
         sm_margin,
+        profile_mode,
     )
 
 
@@ -258,6 +262,7 @@ def _flex_flash_attn_forward_compilable_fake(
     out_type: torch.dtype | None,
     deterministic: bool,
     sm_margin: int,
+    profile_mode: bool,
 ) -> None:
     pass
 
@@ -282,7 +287,10 @@ def _flex_flash_attn_forward(
     out_type: torch.dtype | None,
     deterministic: bool,
     sm_margin: int,
+    profile_mode: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if profile_mode:
+        flexible_flash_attention_utils_cuda.start_event("fwd_prepare")
     q, k, v, q_ranges, k_ranges = [
         maybe_contiguous(x) for x in (q, k, v, q_ranges, k_ranges)
     ]
@@ -313,7 +321,6 @@ def _flex_flash_attn_forward(
     else:
         kblock_m = None
         kblock_n = None
-
     # NOTE: we can not directly compile `_flex_flash_attn_forward`
     # since torch.compile does not allow returning the mutated args (out, lse)
     _flex_flash_attn_forward_compilable(
@@ -336,6 +343,7 @@ def _flex_flash_attn_forward(
         out_type=out_type,
         deterministic=deterministic,
         sm_margin=sm_margin,
+        profile_mode=profile_mode,
     )
 
     return out, lse
@@ -373,9 +381,9 @@ def _flex_flash_attn_backward_compilable(
     dv_type: torch.dtype | None,
     deterministic: bool,
     sm_margin: int,
+    profile_mode: bool,
 ) -> None:
     """torch.ops.flex_flash_attn._flex_flash_attn_backward_compilable"""
-
     mod = get_ffa_jit_mod(
         direction="bwd",
         head_dim=q.shape[-1],
@@ -419,6 +427,7 @@ def _flex_flash_attn_backward_compilable(
         dv_type,
         deterministic,
         sm_margin,
+        profile_mode,
     )
 
 
@@ -447,6 +456,7 @@ def _flex_flash_attn_backward_compilable_fake(
     dv_type: torch.dtype | None,
     deterministic: bool,
     sm_margin: int,
+    profile_mode: bool,
 ) -> None:
     pass
 
@@ -476,7 +486,10 @@ def _flex_flash_attn_backward(
     dv_type: torch.dtype | None,
     deterministic: bool,
     sm_margin: int,
+    profile_mode: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if profile_mode:
+        flexible_flash_attention_utils_cuda.start_event("bwd_prepare")
     dq = torch.zeros_like(q, dtype=dq_type or torch.float32) if dq is None else dq
     dk = torch.zeros_like(k, dtype=dk_type or torch.float32) if dk is None else dk
     dv = torch.zeros_like(v, dtype=dv_type or torch.float32) if dv is None else dv
@@ -507,6 +520,7 @@ def _flex_flash_attn_backward(
         dv_type=dv_type,
         deterministic=deterministic,
         sm_margin=sm_margin,
+        profile_mode=profile_mode,
     )
 
     return dq, dk, dv
@@ -532,11 +546,15 @@ class FlexFlashAttnFunc(torch.autograd.Function):
         disable_fwd_atomic_reduction=False,
         auto_range_merge=False,
         ref_block_size=None,
+        profile_mode=False,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
         if auto_range_merge:
+            if profile_mode:
+                flexible_flash_attention_utils_cuda.start_event("fwd_range_merge")
+
             (
                 merge_q_ranges,
                 fwd_q_ranges,
@@ -545,27 +563,17 @@ class FlexFlashAttnFunc(torch.autograd.Function):
                 fwd_qk_map,
                 fwd_unique_count,
             ) = merge_ranges(q_ranges, k_ranges, attn_type_map=attn_type_map)
-            (
-                merge_k_ranges,
-                bwd_k_ranges,
-                bwd_q_ranges,
-                bwd_attn_type_map,
-                bwd_kq_map,
-                bwd_unique_count,
-            ) = merge_ranges(k_ranges, q_ranges, attn_type_map=attn_type_map)
+
+            if profile_mode:
+                flexible_flash_attention_utils_cuda.stop_event("fwd_range_merge")
+
         else:
             fwd_q_ranges = q_ranges
             fwd_k_ranges = k_ranges
             fwd_attn_type_map = attn_type_map
-            bwd_q_ranges = q_ranges
-            bwd_k_ranges = k_ranges
-            bwd_attn_type_map = attn_type_map
             merge_q_ranges = None
-            merge_k_ranges = None
             fwd_qk_map = None
-            bwd_kq_map = None
             fwd_unique_count = None
-            bwd_unique_count = None
 
         out, lse = _flex_flash_attn_forward(
             q,
@@ -586,68 +594,63 @@ class FlexFlashAttnFunc(torch.autograd.Function):
             q.dtype if disable_fwd_atomic_reduction else torch.float32,  # out_type
             deterministic,
             sm_margin,
+            profile_mode,
         )
 
+        if profile_mode:
+            flexible_flash_attention_utils_cuda.start_event("fwd_cast")
         # Cast output to the same dtype as q
         out = out.to(q.dtype)
+        if profile_mode:
+            flexible_flash_attention_utils_cuda.stop_event("fwd_cast")
 
-        if auto_range_merge:
-            ctx.save_for_backward(
-                q,
-                k,
-                v,
-                out,
-                lse,
-                bwd_q_ranges,
-                bwd_k_ranges,
-                bwd_attn_type_map,
-                merge_k_ranges,
-                bwd_kq_map,
-                bwd_unique_count,
-            )
-        else:
-            ctx.save_for_backward(
-                q, k, v, out, lse, bwd_q_ranges, bwd_k_ranges, bwd_attn_type_map
-            )
+        ctx.save_for_backward(q, k, v, out, lse, q_ranges, k_ranges, attn_type_map)
 
         ctx.softmax_scale = softmax_scale
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
         ctx.auto_range_merge = auto_range_merge
+        ctx.profile_mode = profile_mode
 
         return out, lse
 
     @staticmethod
     def backward(ctx, dout, *args):
+        (
+            q,
+            k,
+            v,
+            out,
+            lse,
+            q_ranges,
+            k_ranges,
+            attn_type_map,
+        ) = ctx.saved_tensors
+
         if ctx.auto_range_merge:
+            if ctx.profile_mode:
+                flexible_flash_attention_utils_cuda.start_event("bwd_range_merge")
+
             (
-                q,
-                k,
-                v,
-                out,
-                lse,
-                bwd_q_ranges,
-                bwd_k_ranges,
-                bwd_attn_type_map,
                 merge_k_ranges,
+                bwd_k_ranges,
+                bwd_q_ranges,
+                bwd_attn_type_map,
                 bwd_kq_map,
                 bwd_unique_count,
-            ) = ctx.saved_tensors
+            ) = merge_ranges(k_ranges, q_ranges, attn_type_map=attn_type_map)
+
+            if ctx.profile_mode:
+                flexible_flash_attention_utils_cuda.stop_event("bwd_range_merge")
+
         else:
-            (
-                q,
-                k,
-                v,
-                out,
-                lse,
-                bwd_q_ranges,
-                bwd_k_ranges,
-                bwd_attn_type_map,
-            ) = ctx.saved_tensors
-            merge_k_ranges = None
-            bwd_kq_map = None
-            bwd_unique_count = None
+            bwd_q_ranges, bwd_k_ranges, bwd_attn_type_map = (
+                q_ranges,
+                k_ranges,
+                attn_type_map,
+            )
+            merge_k_ranges, bwd_kq_map, bwd_unique_count = None, None, None
 
         dq, dk, dv = _flex_flash_attn_backward(
             dout,
@@ -673,11 +676,18 @@ class FlexFlashAttnFunc(torch.autograd.Function):
             dv_type=torch.float32,
             deterministic=ctx.deterministic,
             sm_margin=ctx.sm_margin,
+            profile_mode=ctx.profile_mode,
         )
+
+        if ctx.profile_mode:
+            flexible_flash_attention_utils_cuda.start_event("bwd_cast")
 
         dq = dq.to(q.dtype)
         dk = dk.to(k.dtype)
         dv = dv.to(v.dtype)
+
+        if ctx.profile_mode:
+            flexible_flash_attention_utils_cuda.stop_event("bwd_cast")
 
         return (
             dq,  # q
@@ -693,6 +703,7 @@ class FlexFlashAttnFunc(torch.autograd.Function):
             None,  # disable_fwd_atomic_reduction
             None,  # auto_range_merge
             None,  # ref_block_size
+            None,  # profile_mode
         )
 
 
@@ -713,6 +724,7 @@ def flex_flash_attn_func(
     disable_fwd_atomic_reduction: bool = False,
     auto_range_merge: bool = False,
     ref_block_size: tuple[int, int] | None = None,
+    profile_mode: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     An interface similar to flash attention that doesn't require distributed environment, dispatch or undispatch.
@@ -751,7 +763,7 @@ def flex_flash_attn_func(
             Defaults to ``False``.
 
             **Note:** This flag is usually used in sparse attention cases but still under development.
-
+        profile_mode (bool): profile ffa or not.
     Returns:
         tuple[torch.Tensor, torch.Tensor]:
             - out (torch.Tensor): Attention output tensor
@@ -867,7 +879,6 @@ def flex_flash_attn_func(
         "auto_range_merge and deterministic can't be True at the same time, "
         "due to some unresolved bug to be fixed as soon as possible."
     )
-
     return FlexFlashAttnFunc.apply(
         q,
         k,
@@ -882,4 +893,5 @@ def flex_flash_attn_func(
         disable_fwd_atomic_reduction,
         auto_range_merge,
         ref_block_size,
+        profile_mode,
     )

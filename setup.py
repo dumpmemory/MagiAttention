@@ -174,6 +174,7 @@ def build_ffa_utils_ext_module(
     sources = [
         f"{utils_dir_rel}/bindings.cpp",
         f"{utils_dir_rel}/unique_consecutive_pairs.cu",
+        f"{utils_dir_rel}/profile_utils.cu",
     ]
     include_dirs = [
         common_dir,

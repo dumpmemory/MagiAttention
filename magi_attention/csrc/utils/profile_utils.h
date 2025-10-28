@@ -14,16 +14,23 @@
  * limitations under the License.
  *********************************************************************************/
 
-#include <torch/extension.h>
-#include <tuple>
-#include "profile_utils.h"
-// Forward declaration; implemented in unique_consecutive_pairs.cu
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> unique_consecutive_pairs_ext(torch::Tensor sorted_input_tensor);
+#ifndef CUDA_TIMER_H
+#define CUDA_TIMER_H
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("unique_consecutive_pairs", &unique_consecutive_pairs_ext, "Find unique (int, int) pairs from a pre-sorted [N,2] int32 CUDA tensor");
-  m.def("start_event", &MagiEvents::start, "");
-  m.def("stop_event", &MagiEvents::stop, "");
-  m.def("elapsed_ms_event", &MagiEvents::elapsed_ms, "");
-  m.def("destroy_event", &MagiEvents::destroy, "");
-}
+#include <cuda_runtime.h>
+#include <string>
+#include <unordered_map>
+#include <utility>
+
+struct MagiEvents {
+ public:
+  static void destroy();
+  static void start(const std::string& key);
+  static void stop(const std::string& key);
+  static float elapsed_ms(const std::string& key);
+
+ private:
+  static std::unordered_map<std::string, std::pair<cudaEvent_t, cudaEvent_t>> magi_events;
+};
+
+#endif // CUDA_TIMER_H
