@@ -25,6 +25,7 @@ from torch.testing._internal.common_utils import run_tests
 import magi_attention
 import magi_attention.testing
 from magi_attention import init_dist_attn_runtime_mgr
+from magi_attention.comm.primitive.grpcoll._buffer import GrpCollBuffer
 from magi_attention.comm.primitive.grpcoll._mgr import grpcoll_mgr
 from magi_attention.common.enum import AttnMaskType, AttnOverlapMode
 from magi_attention.common.ranges import AttnRanges
@@ -107,26 +108,24 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
         # -----    set up for native grpcoll   ---- #
 
         if magi_attention.comm.is_native_grpcoll_enable():
-            if self.world_size in (2, 4, 8):
-                for nccl_group in self.nccl_groups:
-                    grpcoll_mgr.register_buffer(
-                        group=nccl_group,
-                        config=GrpCollConfig(
-                            num_nvl_bytes=int(2e9)
-                            * self.world_size
-                            // 8,  # 2GB for 8 ranks
-                        ),
-                    )
-                    grpcoll_mgr.check_registered(group=nccl_group)
+            for nccl_group in self.nccl_groups:
+                grpcoll_mgr.register_buffer(
+                    group=nccl_group,
+                    config=GrpCollConfig(
+                        num_nvl_bytes=int(2e9)
+                        * self.world_size
+                        // 8,  # 2GB for 8 ranks
+                    ),
+                )
+                grpcoll_mgr.check_registered(group=nccl_group)
 
     def destroy_pg(self):
         # -----    clean up for native grpcoll   ---- #
 
         if magi_attention.comm.is_native_grpcoll_enable():
-            if self.world_size in (2, 4, 8):
-                for nccl_group in self.nccl_groups:
-                    grpcoll_mgr.release_buffer(group=nccl_group)
-                    grpcoll_mgr.check_released(group=nccl_group)
+            for nccl_group in self.nccl_groups:
+                grpcoll_mgr.release_buffer(group=nccl_group)
+                grpcoll_mgr.check_released(group=nccl_group)
 
         super().destroy_pg()
 
@@ -531,15 +530,8 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
         # -----    skip for native grpcoll   ---- #
 
         if magi_attention.comm.is_native_grpcoll_enable():
-            # TODO: support other dtypes besides bf16
-            if dtype != torch.bfloat16:
-                return
-            # TODO: support other world sizes
-            if self.world_size not in (2, 4, 8):
-                return
-            # FIXME: figure out the alignment requirement
             hidden_size_kv = num_heads[1] * head_dim
-            if hidden_size_kv % 256 != 0:
+            if hidden_size_kv % GrpCollBuffer.get_hidden_size_alignment(dtype) != 0:
                 return
 
         # -----    construct test case name   ---- #
