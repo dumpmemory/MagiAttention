@@ -15,8 +15,8 @@ using TDkv     = {{ out_t }};
 static constexpr int kHeadDim = {{ head_dim }};
 static constexpr bool kHasSoftcap = {{ has_softcap }};
 static constexpr bool kDisableDkvAtomic = {{ disable_atomic }};
-
 static constexpr bool kDeterministic = {{ deterministic }};
+static constexpr bool kProfileMode = {{ profile_mode }};
 
 // Runtime contract checks to ensure consistency with compile-time constraints
 static inline void _check_runtime_contract_bwd(
@@ -73,8 +73,7 @@ std::vector<at::Tensor> mha_bwd(
     std::optional<at::ScalarType> dk_type_,
     std::optional<at::ScalarType> dv_type_,
     bool const deterministic,
-    int const sm_margin,
-    bool const profile_mode) {
+    int const sm_margin) {
   _check_runtime_contract_bwd(q, dk_type_, dv_type_, softcap, disable_bwd_dkv_atomic_reduction);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -86,12 +85,11 @@ std::vector<at::Tensor> mha_bwd(
       attn_type_map_, merge_k_ranges_, bwd_kq_map_,
       bwd_unique_count_, softmax_scale, softcap, disable_bwd_dkv_atomic_reduction,
       dq_type_, dk_type_, dv_type_, deterministic, sm_margin);
-  if (profile_mode) {
+  if constexpr (kProfileMode) 
     MagiEvents::stop("bwd_prepare");
-  }
   
   // Kernel launch (single variant)
-  run_mha_bwd_<kArch, TCompute, TDkv, kHeadDim, kHasSoftcap, kDisableDkvAtomic, kDeterministic>(params, stream, profile_mode);
+  run_mha_bwd_<kArch, TCompute, TDkv, kHeadDim, kHasSoftcap, kDisableDkvAtomic, kDeterministic, kProfileMode>(params, stream);
 
   return {dq, dk, dv};
 }

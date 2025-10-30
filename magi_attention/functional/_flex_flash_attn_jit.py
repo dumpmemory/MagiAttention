@@ -28,7 +28,7 @@ from magi_attention.common.jit.utils import write_if_different
 # We need to import the CUDA kernels after importing torch
 is_ffa_utils_installed = False
 try:
-    from magi_attention import flexible_flash_attention_utils_cuda  # type: ignore[attr-defined]
+    from magi_attention import flexible_flash_attention_utils_cuda as ffa_utils  # type: ignore[attr-defined]
 
     is_ffa_utils_installed = True
 except ImportError:
@@ -81,6 +81,7 @@ def get_ffa_uri(
     softcap: bool,
     disable_atomic_reduction: bool,
     deterministic: bool,
+    profile_mode: bool,
     kblock_m: int | None,
     kblock_n: int | None,
 ) -> str:
@@ -96,6 +97,7 @@ def get_ffa_uri(
         f"{'_softcap' if softcap else ''}"
         f"{'' if disable_atomic_reduction else '_atomic'}"
         f"{'_deterministic' if deterministic else ''}"
+        f"{'_profile_mode' if profile_mode else ''}"
         + (
             f"_m{kblock_m}n{kblock_n}"
             if kblock_m is not None and kblock_n is not None
@@ -142,6 +144,7 @@ def get_ffa_jit_spec(
     softcap: bool,
     disable_atomic_reduction: bool,
     deterministic: bool,
+    profile_mode: bool,
     ref_block_size: tuple[int, int] | None = None,
 ) -> tuple[JitSpec, str]:
     sanity_check(arch, direction, head_dim, compute_dtype, output_dtype)
@@ -166,6 +169,7 @@ def get_ffa_jit_spec(
         softcap,
         disable_atomic_reduction,
         deterministic,
+        profile_mode,
         kblock_m,
         kblock_n,
     )
@@ -186,6 +190,7 @@ def get_ffa_jit_spec(
     out_t = _DTYPE_TO_CUTLASS[output_dtype]
     has_softcap = bool(softcap)
     disable_atomic = bool(disable_atomic_reduction)
+    profile_mode = bool(profile_mode)
 
     rendered = template.render(
         arch_sm_num=arch_sm_num,
@@ -195,6 +200,7 @@ def get_ffa_jit_spec(
         has_softcap=str(has_softcap).lower(),
         disable_atomic=str(disable_atomic).lower(),
         deterministic=str(deterministic).lower(),
+        profile_mode=str(profile_mode).lower(),
         kblock_m=(kblock_m if kblock_m is not None else ""),
         kblock_n=(kblock_n if kblock_n is not None else ""),
     )
@@ -248,7 +254,7 @@ def get_ffa_jit_spec(
             "This is a required dependency for JIT compilation."
         )
         # add utils.so(Dynamic linking)
-        utils_so_path = Path(flexible_flash_attention_utils_cuda.__file__)
+        utils_so_path = Path(ffa_utils.__file__)
 
         return common_objects + [str(utils_so_path)]
 
@@ -274,6 +280,7 @@ def get_ffa_jit_mod(
     softcap: bool,
     disable_atomic_reduction: bool,
     deterministic: bool,
+    profile_mode: bool,
     ref_block_size: tuple[int, int] | None = None,
 ) -> Any:
     assert torch.cuda.is_available(), "CUDA is not available"
@@ -289,6 +296,7 @@ def get_ffa_jit_mod(
         softcap,
         disable_atomic_reduction,
         deterministic,
+        profile_mode,
         ref_block_size,
     )
 

@@ -55,7 +55,7 @@ DISABLE_SM90_FEATURES = os.getenv("MAGI_ATTENTION_DISABLE_SM90_FEATURES", "0") =
 # instead, we only pre-build some common options with ref_block_size=None if PREBUILD_FFA is True
 # and leave others built in jit mode
 PREBUILD_FFA = os.getenv("MAGI_ATTENTION_PREBUILD_FFA", "1") == "1"
-PREBUILD_FFA_JOBS = int(os.getenv("MAGI_ATTENTION_PREBUILD_FFA_JOBS", "256"))
+PREBUILD_FFA_JOBS = int(os.getenv("MAGI_ATTENTION_PREBUILD_FFA_JOBS", "160"))
 
 # You can also set the flags below to skip building other ext modules
 SKIP_FFA_UTILS_BUILD = os.getenv("MAGI_ATTENTION_SKIP_FFA_UTILS_BUILD", "0") == "1"
@@ -402,11 +402,12 @@ def prebuild_ffa_kernels() -> None:
     # determine the combinations of prebuild options
     directions = ["fwd", "bwd"]
     head_dims = [64, 128]
-    compute_dtypes = [torch.bfloat16, torch.float16]
-    out_dtypes = [torch.float32, torch.bfloat16, torch.float16]
+    compute_dtypes = [torch.float16, torch.bfloat16]
+    out_dtypes = [torch.float32, torch.float16, torch.bfloat16]
     softcaps = [False, True]
     disable_atomic_opts = [False, True]
     deterministics = [False, True]
+    profile_mode = [False]
 
     combos = itertools.product(
         directions,
@@ -416,11 +417,12 @@ def prebuild_ffa_kernels() -> None:
         softcaps,
         disable_atomic_opts,
         deterministics,
+        profile_mode,
     )
 
     # prebuild the kernels in parallel for the determined options
     def _build_one(args):
-        direction, h, cdtype, odtype, sc, da, det = args
+        direction, h, cdtype, odtype, sc, da, det, pro = args
         spec, uri = get_ffa_jit_spec(
             arch=(9, 0),
             direction=direction,
@@ -430,6 +432,7 @@ def prebuild_ffa_kernels() -> None:
             softcap=sc,
             disable_atomic_reduction=da,
             deterministic=det,
+            profile_mode=pro,
             ref_block_size=None,
         )
         spec.build()
@@ -475,7 +478,7 @@ if not SKIP_CUDA_BUILD:
     if magi_attn_ext_module is not None:
         ext_modules.append(magi_attn_ext_module)
 
-    # build utils ext module
+    # build ffa utils ext module
     ffa_utils_ext_module = build_ffa_utils_ext_module(
         repo_dir=repo_dir,
         csrc_dir=csrc_dir,
