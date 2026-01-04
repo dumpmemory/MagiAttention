@@ -64,7 +64,6 @@ from magi_attention.utils._utils import make_attn_mask_from_ffa_args
 # impls = ["ffa", "fa3", "fa4"]
 impls = ["ffa", "cudnn", "fa3", "fa4"]
 
-
 mask_types = ["full"]
 # mask_types = ["causal"]
 # mask_types = ["varlen_full"]
