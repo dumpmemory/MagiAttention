@@ -31,16 +31,17 @@ from magi_attention.utils.sparse_utils import (
     choose_ref_block,  # TODO: refactor choose ref_block
 )
 from magi_attention.utils.sparse_utils import (
-    flatten_block_mask_to_kv_shape,
     generate_block_sparse_pattern,
-    generate_ranges_from_block_mask,
+    generate_ranges_from_block_mask_triton,
+    generate_ranges_from_topk_indices_triton,
     get_sdpa_mask_from_block_sparse_mask,
 )
 
 impls = ["ffa"]
 
 # actual seqlen
-seqlens = [32768 * (i + 1) for i in range(0, 4)]
+seqlens = [32768 * (i + 1) for i in range(0, 2)]
+seqlens = [8192, 16384, 32768, 65536]
 
 # current block sparse attention always has low sparsity
 sparsity_ratio = [0.05, 0.1, 0.2, 0.5, 1.0]
@@ -48,17 +49,19 @@ sparsity_ratio = [0.05, 0.1, 0.2, 0.5, 1.0]
 ds = [128]
 wds = ["fwd"]
 attn_modes = ["GQA"]  # MHA, GQA
-nhqs = [64]
+nhqs = [16]
 num_groups = [4]
 # small K block
-# q_block_sizes = [64, 64, 64, 64, 64]
-# k_block_sizes = [64, 32, 16, 8, 1]
+q_block_sizes = [128, 128, 128, 128, 128, 128]
+k_block_sizes = [128, 64, 32, 16, 8, 1]
 # small Q block
-q_block_sizes = [64, 128]
-k_block_sizes = [64, 128]
+# q_block_sizes = [64, 32, 16, 8]
+# k_block_sizes = [64, 64, 64, 64]
 # large Q block and K block
 # q_block_sizes = [64, 128]
 # k_block_sizes = [64, 128]
+
+sparse_format = "block_mask"
 
 assert len(q_block_sizes) == len(k_block_sizes)
 
@@ -135,6 +138,7 @@ def sparse_attn_benchmark(
     attn_impl,
 ):
     assert b == 1, "for now, we only supports b=1 for ffa"
+    print(f"=====Running with {q_block_size=}, {k_block_size=} {seqlen=} ")
     is_attn_impl_support_this_mask = True
     already_known_oom_before_run = False
 
@@ -165,6 +169,7 @@ def sparse_attn_benchmark(
         num_q_blocks=num_q_blocks_orig,
         num_kv_blocks=num_kv_blocks_orig,
         sparsity=sparsity_ratio,
+        sparse_format=sparse_format,
         device="cuda",
     )
     # generate block mask totally random.
@@ -187,7 +192,7 @@ def sparse_attn_benchmark(
     if attn_impl in ("ffa"):
         h1 = nhk
         # h2 = nhq // nhk
-        q = rearrange(q, "b s (h1 h2) d -> (b s h1) h2 d", h1=h1)
+        q = rearrange(q, "b s (h1 h2) d -> (b h1 s) h2 d", h1=h1)
         k = rearrange(k, "b s h d -> (b h s) 1 d")
         v = rearrange(v, "b s h d -> (b h s) 1 d")
 
@@ -210,15 +215,17 @@ def sparse_attn_benchmark(
     )
     if is_attn_impl_support_this_mask:
         if attn_impl == "ffa":
-            # flatten headdim for ffa cause
-            # flat_block_sparse_mask = flatten_block_mask(block_mask, nhq, nhk)
-            flat_block_sparse_mask = flatten_block_mask_to_kv_shape(block_mask)
-            q_ranges, k_ranges = generate_ranges_from_block_mask(
-                flat_block_sparse_mask, block_m, block_n
-            )
+            if sparse_format == "block_mask":
+                q_ranges, k_ranges = generate_ranges_from_block_mask_triton(
+                    block_mask, block_m, block_n
+                )
+            elif sparse_format == "topk":
+                q_ranges, k_ranges = generate_ranges_from_topk_indices_triton(
+                    block_mask, block_m, block_n, orig_seq_len_k // block_n
+                )
+
             attn_type_map = torch.zeros(len(q_ranges), dtype=torch.int32, device="cuda")
 
-            # TODO: SwapAB will change this constraint
             qhead_per_khead = nhq // nhk
             ref_block_params = choose_ref_block(
                 (q_block_size, k_block_size), qhead_per_khead=qhead_per_khead
@@ -234,6 +241,7 @@ def sparse_attn_benchmark(
                     k_ranges=k_ranges,
                     attn_type_map=attn_type_map,
                     auto_range_merge=True,  # we should enable auto_range_merge for block sparse mask.
+                    disable_fwd_atomic_reduction=True,
                     **ref_block_params,
                 )
 
@@ -569,15 +577,16 @@ def sparse_attn_benchmark(
                         "mem": [-2, -2, -2],
                     }
                     # raise e
-                # -1 indicates oom
-                perf_dict = {
-                    "flops": [-1, -1, -1],
-                    "mem": [-1, -1, -1],
-                }
-                print(
-                    f"Error occured before running {attn_impl} with {q_block_size=}, {k_block_size=} "
-                    f"when {seqlen=}, {hd=} during {wd}: {e=}"
-                )
+                else:
+                    # -1 indicates oom
+                    perf_dict = {
+                        "flops": [-1, -1, -1],
+                        "mem": [-1, -1, -1],
+                    }
+                    print(
+                        f"Error occured before running {attn_impl} with {q_block_size=}, {k_block_size=} "
+                        f"when {seqlen=}, {hd=} during {wd}: {e=}"
+                    )
     else:
         # -2 indicates not support
         perf_dict = {

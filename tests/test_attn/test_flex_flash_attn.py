@@ -50,12 +50,66 @@ class TestFlexFlashAttn(DistTestBase):
         # Store as instance variable so we can access it later by index
         # NOTE: this may cause excessive compilation time.
         self.valid_ref_block_configs = [
-            {"swap_ab": False, "ref_block_size": None, "pack_gqa": False},
-            {"swap_ab": False, "ref_block_size": (128, 128), "pack_gqa": True},
-            {"swap_ab": True, "ref_block_size": (8, 64), "pack_gqa": False},
-            {"swap_ab": True, "ref_block_size": (16, 64), "pack_gqa": False},
-            {"swap_ab": True, "ref_block_size": (32, 64), "pack_gqa": False},
-            {"swap_ab": True, "ref_block_size": (64, 64), "pack_gqa": True},
+            # general
+            {
+                "swap_ab": False,
+                "ref_block_size": None,
+                "pack_gqa": False,
+                "sparse_load": False,
+            },
+            # pack_gqa
+            {
+                "swap_ab": False,
+                "ref_block_size": (128, 128),
+                "pack_gqa": True,
+                "sparse_load": False,
+            },
+            # sparse_load
+            {
+                "swap_ab": False,
+                "ref_block_size": (128, 128),
+                "pack_gqa": False,
+                "sparse_load": True,
+            },
+            {
+                "swap_ab": False,
+                "ref_block_size": (64, 128),
+                "pack_gqa": False,
+                "sparse_load": True,
+            },
+            # sparse_load & pack_gqa
+            {
+                "swap_ab": False,
+                "ref_block_size": (64, 128),
+                "pack_gqa": True,
+                "sparse_load": True,
+            },
+            # swap_ab
+            {
+                "swap_ab": True,
+                "ref_block_size": (8, 64),
+                "pack_gqa": False,
+                "sparse_load": False,
+            },
+            {
+                "swap_ab": True,
+                "ref_block_size": (16, 64),
+                "pack_gqa": False,
+                "sparse_load": False,
+            },
+            {
+                "swap_ab": True,
+                "ref_block_size": (32, 64),
+                "pack_gqa": False,
+                "sparse_load": False,
+            },
+            # swap_ab & pack_gqa
+            {
+                "swap_ab": True,
+                "ref_block_size": (64, 64),
+                "pack_gqa": True,
+                "sparse_load": False,
+            },
         ]
 
         # Use indices instead of dicts to make them hashable
@@ -225,6 +279,7 @@ class TestFlexFlashAttn(DistTestBase):
         k_ranges_tensor: torch.Tensor,
         attn_type_map_tensor: torch.Tensor,
         auto_range_merge: bool,
+        sparse_load: bool,
         o_ref: torch.Tensor,
         lse_ref: torch.Tensor,
         dq_ref: torch.Tensor,
@@ -263,6 +318,7 @@ class TestFlexFlashAttn(DistTestBase):
             swap_ab=swap_ab,
             ref_block_size=ref_block_size,
             pack_gqa=pack_gqa,
+            sparse_load=sparse_load,
         )
         o.backward(do)
 
@@ -362,6 +418,9 @@ class TestFlexFlashAttn(DistTestBase):
             merge_q_ranges=merge_q_ranges,
             qk_map=fwd_qk_map,
             fwd_unique_count=fwd_unique_count,
+            sparse_load_loop_count=None,
+            sparse_load_invalid_count=None,
+            equal_k_range_size=None,
             ref_block_size=None,
             softmax_scale=softmax_scale,
             softcap=0.0,
@@ -371,6 +430,7 @@ class TestFlexFlashAttn(DistTestBase):
             sm_margin=0,
             max_seqlen_q=max_seqlen_q,
             pack_gqa=pack_gqa,
+            sparse_load=False,
         )
 
         o_ref, lse_ref = correct_attn_fwd_result(
@@ -393,6 +453,9 @@ class TestFlexFlashAttn(DistTestBase):
             merge_q_ranges=merge_q_ranges,
             qk_map=fwd_qk_map,
             fwd_unique_count=fwd_unique_count,
+            sparse_load_loop_count=None,
+            sparse_load_invalid_count=None,
+            equal_k_range_size=None,
             ref_block_size=None,
             softmax_scale=softmax_scale,
             softcap=0.0,
@@ -402,6 +465,7 @@ class TestFlexFlashAttn(DistTestBase):
             sm_margin=0,
             max_seqlen_q=max_seqlen_q,
             pack_gqa=pack_gqa,
+            sparse_load=False,
         )
 
         assert_close(
@@ -974,6 +1038,7 @@ class TestFlexFlashAttn(DistTestBase):
         auto_range_merge: bool,
         deterministic: bool,
         test_accumulation_inplace: bool,
+        sparse_load: bool,
         sink_layout: AttnSinkLayout,
         swap_ab: bool,
         ref_block_size: tuple[int, int] | None,
@@ -984,6 +1049,14 @@ class TestFlexFlashAttn(DistTestBase):
     ) -> None:
         if auto_range_merge and deterministic:
             return
+        if swap_ab and sparse_load:  # swap_ab is not supported with sparse_load
+            return
+        if sparse_load:  # sparse load supports only auto_range_merge and full attn_type
+            if not auto_range_merge or test_accumulation_inplace:
+                return
+            for attn_type in attn_type_map:
+                if attn_type != 0:
+                    return
 
         # FIXME: for square bi-causal mask, i.e. when only the main diagonal is valid
         # ffa bwd kernel encounters with some precision issue with dq/dk,
@@ -1078,6 +1151,7 @@ class TestFlexFlashAttn(DistTestBase):
             swap_ab=swap_ab,
             ref_block_size=ref_block_size,
             pack_gqa=pack_gqa,
+            sparse_load=sparse_load,
         )
 
         # run ffa backward
@@ -1098,6 +1172,7 @@ class TestFlexFlashAttn(DistTestBase):
                 k_ranges_tensor=k_ranges_tensor,
                 attn_type_map_tensor=attn_type_map_tensor,
                 auto_range_merge=auto_range_merge,
+                sparse_load=sparse_load,
                 o_ref=o,
                 lse_ref=lse,
                 dq_ref=q.grad,
@@ -1505,6 +1580,7 @@ class TestFlexFlashAttn(DistTestBase):
         swap_ab = ref_block_config["swap_ab"]
         ref_block_size = ref_block_config["ref_block_size"]
         pack_gqa = ref_block_config["pack_gqa"]
+        sparse_load = ref_block_config["sparse_load"]
 
         if random_attn_type_map:
             # we now support attn type idx in {0, 1, 2, 3}
@@ -1526,6 +1602,7 @@ class TestFlexFlashAttn(DistTestBase):
             f"[swap_ab={swap_ab}]"
             f"[ref_block_size={ref_block_size}]"
             f"[pack_gqa={pack_gqa}]"
+            f"[sparse_load={sparse_load}]"
             f"[has_sink={seqlen_sink > 0}]"
             f"[sink_layout={sink_layout}] x "
             f"{flag_comb_test_case}"
@@ -1545,6 +1622,7 @@ class TestFlexFlashAttn(DistTestBase):
             auto_range_merge=auto_range_merge,
             deterministic=deterministic,
             test_accumulation_inplace=test_accumulation_inplace,
+            sparse_load=sparse_load,
             sink_layout=sink_layout,
             swap_ab=swap_ab,
             ref_block_size=ref_block_size,
@@ -1684,6 +1762,7 @@ class TestFlexFlashAttn(DistTestBase):
         swap_ab = ref_block_config["swap_ab"]
         ref_block_size = ref_block_config["ref_block_size"]
         pack_gqa = ref_block_config["pack_gqa"]
+        sparse_load = ref_block_config["sparse_load"]
         test_accumulation_inplace = bool(
             flag_comb.get("test_accumulation_inplace", False)
         )
@@ -1709,6 +1788,7 @@ class TestFlexFlashAttn(DistTestBase):
             f"[swap_ab={swap_ab}]"
             f"[ref_block_size={ref_block_size}]"
             f"[pack_gqa={pack_gqa}] x "
+            f"[sparse_load={sparse_load}]"
             f"{flag_comb_test_case}"
         )
 
@@ -1726,6 +1806,7 @@ class TestFlexFlashAttn(DistTestBase):
             auto_range_merge=auto_range_merge,
             deterministic=deterministic,
             test_accumulation_inplace=test_accumulation_inplace,
+            sparse_load=sparse_load,
             swap_ab=swap_ab,
             ref_block_size=ref_block_size,
             pack_gqa=pack_gqa,
@@ -1786,6 +1867,7 @@ class TestFlexFlashAttn(DistTestBase):
             # FIXME: compiling does not support auto_range_merge
             # due to custom unique_consecutive_pairs kernel with dynamic output shape
             auto_range_merge=False,
+            sparse_load=False,
         )
         o.backward(do)
         dq, dk, dv, dsink = q.grad, k.grad, v.grad, sink.grad
