@@ -24,10 +24,10 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
 import magi_attention
-from magi_attention import is_cpp_backend_enable
 from magi_attention.comm.primitive.grpcoll.utils import (
     sanity_check_for_group_cast_meta_args_per_rank,
 )
+from magi_attention.common import is_cpp_backend_enable
 from magi_attention.common.enum import AttnMaskType, AttnOverlapMode
 from magi_attention.common.range import AttnRange
 from magi_attention.common.ranges import AttnRanges
@@ -209,8 +209,8 @@ class DistAttnSolver(BaseDistAttnSolver):
         attn_mask_type: Union[list[int], list[AttnMaskType], AttnMaskType, int],
         dispatch_meta_q: DispatchMeta,
         dispatch_meta_k: DispatchMeta,
-        flatten_head_groups: bool = False,
     ) -> None:
+        flatten_head_groups = magi_attention.is_flatten_head_groups_enable()
         if flatten_head_groups:
             self.num_heads_group = self.num_heads_kv
             self.num_heads_q = self.num_heads_q // self.num_heads_group

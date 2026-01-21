@@ -18,8 +18,12 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
 import magi_attention
-from magi_attention import is_cpp_backend_enable
-from magi_attention.common import AttnRange, AttnRanges, AttnRectangles
+from magi_attention.common import (
+    AttnRange,
+    AttnRanges,
+    AttnRectangles,
+    is_cpp_backend_enable,
+)
 from magi_attention.common.enum import AttnMaskType
 from magi_attention.meta.algorithms import DynamicAttnAlgorithm
 from magi_attention.meta.collection.calc_meta import AttnArg, CalcMeta
@@ -121,8 +125,8 @@ class DynamicAttnSolver(BaseDistAttnSolver):
         q_ranges: AttnRanges,
         k_ranges: AttnRanges,
         attn_mask_type: Union[list[int], list[AttnMaskType], AttnMaskType],
-        flatten_head_groups: bool = False,
     ):
+        flatten_head_groups = magi_attention.is_flatten_head_groups_enable()
         if flatten_head_groups:
             self.num_heads_group = self.num_heads_kv
             self.num_heads_q = self.num_heads_q // self.num_heads_group
@@ -186,11 +190,6 @@ class DynamicAttnSolver(BaseDistAttnSolver):
         visualize: bool = False,
         save_path: str | None = None,
     ) -> None:
-        # for rank in range(self.cp_size):
-        #     print(f"rank {rank} bucket:")
-        #     for rect in self.bucket_per_rank[rank]:
-        #         print(rect)
-
         if not visualize:
             return
 
