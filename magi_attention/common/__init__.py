@@ -12,12 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from magi_attention import is_cpp_backend_enable
+
 from . import enum, jit, range_op
 from .mask import AttnMask
 from .range import AttnRange, RangeError
 from .ranges import AttnRanges
 from .rectangle import AttnRectangle
 from .rectangles import AttnRectangles
+
+# Try to use C++ extensions for core data structures to avoid Python overhead
+# The submodules (range, ranges, rectangle, rectangles, enum) already handle
+# the C++ backend replacement internally. We just need to set USE_CPP_BACKEND
+# for informational purposes and external visibility.
+
+USE_CPP_BACKEND = False
+if is_cpp_backend_enable():
+    try:
+        from magi_attention.magi_attn_ext import AttnRange as _CppAttnRange
+
+        if AttnRange is _CppAttnRange:
+            USE_CPP_BACKEND = True
+    except ImportError:
+        pass
 
 __all__ = [
     "enum",
@@ -29,4 +46,5 @@ __all__ = [
     "AttnRectangle",
     "AttnRectangles",
     "range_op",
+    "USE_CPP_BACKEND",
 ]
