@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import logging
 import os
 import warnings
 
@@ -21,6 +22,36 @@ from .dist_attn_runtime_mgr import (
     init_dist_attn_runtime_key,
     init_dist_attn_runtime_mgr,
 )
+
+try:
+    from . import magi_attn_ext  # type: ignore[attr-defined]  # noqa: F401
+except ImportError as e:
+    warnings.warn(
+        f"Failed to import magi_attn_ext extension module. "
+        f"Please make sure MagiAttention is properly installed. "
+        f"Original error message: {e}"
+    )
+
+try:
+    from . import magi_attn_comm  # type: ignore[attr-defined]  # noqa: F401
+except ImportError as e:
+    warnings.warn(
+        f"Failed to import magi_attn_comm extension module. "
+        f"Please make sure MagiAttention is properly installed. "
+        f"Original error message: {e}"
+    )
+
+try:
+    from . import (  # type: ignore[attr-defined] # noqa: F401
+        flexible_flash_attention_utils_cuda,
+    )
+except ImportError as e:
+    warnings.warn(
+        f"Failed to import flexible_flash_attention_utils_cuda extension module. "
+        f"Please make sure MagiAttention is properly installed. "
+        f"Original error message: {e}"
+    )
+
 
 if importlib.util.find_spec("magi_attention._version") is None:
     warnings.warn(
@@ -33,6 +64,13 @@ else:
     version = git_version
 
 __version__: str | None = version
+
+# Initialize a logger specific to this module/namespace
+logger = logging.getLogger(__name__)
+
+# Add a NullHandler to prevent logging warnings ("No handlers could be found...")
+# if the application using this library hasn't configured logging.
+logger.addHandler(logging.NullHandler())
 
 
 def is_sanity_check_enable() -> bool:
@@ -123,4 +161,7 @@ __all__ = [
     "config",
     "comm",
     "functional",
+    "magi_attn_ext",
+    "magi_attn_comm",
+    "flexible_flash_attention_utils_cuda",
 ]

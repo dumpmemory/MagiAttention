@@ -21,6 +21,7 @@
 #include <torch/types.h>
 
 #include "attn_ranges.hpp"
+#include "kernel_barrier.cuh"
 #include "rectangles.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
