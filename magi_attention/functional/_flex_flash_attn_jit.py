@@ -84,13 +84,15 @@ def get_ffa_uri(
     softcap: bool,
     disable_atomic_reduction: bool,
     deterministic: bool,
-    profile_mode: bool,
+    kblock_m: int | None,
+    kblock_n: int | None,
+    auto_range_merge: bool,
+    swap_ab: bool,
     pack_gqa: bool,
     qhead_per_khead: int,
     sparse_load: bool,
-    kblock_m: int | None,
-    kblock_n: int | None,
-    swap_ab: bool,
+    swap_bwd_qk_loop: bool,
+    profile_mode: bool,
 ) -> str:
     def _dtype_name(dt: torch.dtype) -> str:
         return str(dt).split(".")[-1]
@@ -104,11 +106,13 @@ def get_ffa_uri(
         f"{'_softcap' if softcap else ''}"
         f"{'' if disable_atomic_reduction else '_atomic'}"
         f"{'_deterministic' if deterministic else ''}"
+        f"{'_autorangemerge' if auto_range_merge else ''}"
         f"{'_swapab' if swap_ab else ''}"
-        f"{'_profile_mode' if profile_mode else ''}"
         f"{'_packgqa' if pack_gqa else ''}"
         f"{f'_{qhead_per_khead}' if pack_gqa else ''}"
         f"{'_sparse_load' if sparse_load else ''}"
+        f"{'_swapbwdqkloop' if swap_bwd_qk_loop else ''}"
+        f"{'_profile_mode' if profile_mode else ''}"
         + (
             f"_m{kblock_m}n{kblock_n}"
             if kblock_m is not None and kblock_n is not None
@@ -129,6 +133,7 @@ def sanity_check(
     output_dtype: torch.dtype,
     ref_block_size: tuple[int, int] | None = None,
     swap_ab: bool = False,
+    swap_bwd_qk_loop: bool = False,
 ):
     check_cuda_compute_capability(arch)
     assert direction in ("fwd", "bwd"), "direction must be either fwd or bwd"
@@ -164,6 +169,10 @@ def sanity_check(
             assert (
                 kblock_n % 16 == 0 and kblock_n <= 256
             ), "ref_block_size: (kblock_m, kblock_n), kblock_n <= 256 and kblock_n % 16 == 0 must be True"
+    if swap_bwd_qk_loop:
+        assert (
+            direction == "bwd"
+        ), "swap_bwd_qk_loop only take effect when direction == 'bwd'"
 
 
 def get_ffa_jit_spec(
@@ -175,15 +184,24 @@ def get_ffa_jit_spec(
     softcap: bool,
     disable_atomic_reduction: bool,
     deterministic: bool,
-    profile_mode: bool,
+    ref_block_size: tuple[int, int] | None = None,
+    auto_range_merge: bool = False,
+    swap_ab: bool = False,
     pack_gqa: bool = False,
     qhead_per_khead: int = 1,
-    ref_block_size: tuple[int, int] | None = None,
-    swap_ab: bool = False,
     sparse_load: bool = False,
+    swap_bwd_qk_loop: bool = False,
+    profile_mode: bool = False,
 ) -> tuple[JitSpec, str]:
     sanity_check(
-        arch, direction, head_dim, compute_dtype, output_dtype, ref_block_size, swap_ab
+        arch=arch,
+        direction=direction,
+        head_dim=head_dim,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+        ref_block_size=ref_block_size,
+        swap_ab=swap_ab,
+        swap_bwd_qk_loop=swap_bwd_qk_loop,
     )
 
     # Convert arch to SM number
@@ -198,21 +216,23 @@ def get_ffa_jit_spec(
             kblock_m, kblock_n = None, None
 
     uri = get_ffa_uri(
-        arch_sm_num,
-        direction,
-        head_dim,
-        compute_dtype,
-        output_dtype,
-        softcap,
-        disable_atomic_reduction,
-        deterministic,
-        profile_mode,
-        pack_gqa,
-        qhead_per_khead,
-        sparse_load,
-        kblock_m,
-        kblock_n,
-        swap_ab,
+        arch_sm_num=arch_sm_num,
+        direction=direction,
+        head_dim=head_dim,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+        softcap=softcap,
+        disable_atomic_reduction=disable_atomic_reduction,
+        deterministic=deterministic,
+        kblock_m=kblock_m,
+        kblock_n=kblock_n,
+        auto_range_merge=auto_range_merge,
+        swap_ab=swap_ab,
+        pack_gqa=pack_gqa,
+        qhead_per_khead=qhead_per_khead,
+        sparse_load=sparse_load,
+        swap_bwd_qk_loop=swap_bwd_qk_loop,
+        profile_mode=profile_mode,
     )
 
     gen_directory = jit_env.MAGI_ATTENTION_GEN_SRC_DIR / uri
@@ -231,8 +251,12 @@ def get_ffa_jit_spec(
     out_t = _DTYPE_TO_CUTLASS[output_dtype]
     has_softcap = bool(softcap)
     disable_atomic = bool(disable_atomic_reduction)
+    deterministic = bool(deterministic)
     profile_mode = bool(profile_mode)
+    auto_range_merge = bool(auto_range_merge)
+    swap_ab = bool(swap_ab)
     pack_gqa = bool(pack_gqa)
+    swap_bwd_qk_loop = bool(swap_bwd_qk_loop)
 
     rendered = template.render(
         arch_sm_num=arch_sm_num,
@@ -243,12 +267,14 @@ def get_ffa_jit_spec(
         disable_atomic=str(disable_atomic).lower(),
         deterministic=str(deterministic).lower(),
         profile_mode=str(profile_mode).lower(),
-        pack_gqa=str(pack_gqa).lower(),
         kblock_m=(kblock_m if kblock_m is not None else ""),
         kblock_n=(kblock_n if kblock_n is not None else ""),
-        qhead_per_khead=qhead_per_khead,
+        auto_range_merge=str(auto_range_merge).lower(),
         swap_ab=str(swap_ab).lower(),
+        pack_gqa=str(pack_gqa).lower(),
+        qhead_per_khead=qhead_per_khead,
         sparse_load=str(sparse_load).lower(),
+        swap_bwd_qk_loop=str(swap_bwd_qk_loop).lower(),
     )
 
     inst_cu = gen_directory / f"{direction}_inst.cu"
@@ -334,12 +360,14 @@ def get_ffa_jit_mod(
     softcap: bool,
     disable_atomic_reduction: bool,
     deterministic: bool,
-    profile_mode: bool,
+    ref_block_size: tuple[int, int] | None = None,
+    auto_range_merge: bool = False,
+    swap_ab: bool = False,
     pack_gqa: bool = False,
     qhead_per_khead: int = 1,
-    ref_block_size: tuple[int, int] | None = None,
-    swap_ab: bool = False,
     sparse_load: bool = False,
+    swap_bwd_qk_loop: bool = False,
+    profile_mode: bool = False,
 ) -> Any:
     assert torch.cuda.is_available(), "CUDA is not available"
     arch = torch.cuda.get_device_capability()
@@ -348,20 +376,22 @@ def get_ffa_jit_mod(
         qhead_per_khead = 1
 
     spec, _ = get_ffa_jit_spec(
-        arch,
-        direction,
-        head_dim,
-        compute_dtype,
-        output_dtype,
-        softcap,
-        disable_atomic_reduction,
-        deterministic,
-        profile_mode,
-        pack_gqa,
-        qhead_per_khead,
-        ref_block_size,
-        swap_ab,
-        sparse_load,
+        arch=arch,
+        direction=direction,
+        head_dim=head_dim,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+        softcap=softcap,
+        disable_atomic_reduction=disable_atomic_reduction,
+        deterministic=deterministic,
+        ref_block_size=ref_block_size,
+        auto_range_merge=auto_range_merge,
+        swap_ab=swap_ab,
+        pack_gqa=pack_gqa,
+        qhead_per_khead=qhead_per_khead,
+        sparse_load=sparse_load,
+        swap_bwd_qk_loop=swap_bwd_qk_loop,
+        profile_mode=profile_mode,
     )
 
     return spec.build_and_load()

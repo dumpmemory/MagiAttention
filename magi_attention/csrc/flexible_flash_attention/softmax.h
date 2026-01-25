@@ -89,8 +89,10 @@ CUTLASS_DEVICE void warp_group_reduce_column_(Tensor<Engine0, Layout0>& tensor, 
   // Ensure that the shmem writes of the current thread
   // are visible to other threads within the same warp group
   __threadfence_block();
+
   // Sync on the current mma warp group's named barrier, wait for write
-  cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpGroupSwapAB1) + curr_WG /*id*/);
+  BarrierManager::sync<cutlass::NumThreadsPerWarpGroup>(FwdNamedBarriers::WarpGroupSwapAB1, /*warp_group_idx=*/curr_WG);
+
 #pragma unroll
   for (int ni = 0; ni < size<0>(tensor); ni++) {
     // global index is the column id of register in mma result
@@ -109,7 +111,7 @@ CUTLASS_DEVICE void warp_group_reduce_column_(Tensor<Engine0, Layout0>& tensor, 
     //   tensor(ni) = op(tensor(ni), shared_result[curr_WG][warp_id ^ 2][global_index]);
     //   tensor(ni) = op(tensor(ni), shared_result[curr_WG][warp_id ^ 3][global_index]);
     // }
-    // tensor(ni) = __shfl_sync(0xffffffff, tensor(ni), (lane & 0x3));
+    // tensor(ni) = broadcast_in_warp(tensor(ni), /*src_lane=*/(lane & 0x3));
   }
 }
 
@@ -218,10 +220,24 @@ CUTLASS_DEVICE Element calc_lse_rescale_weight(Element lse_to_rescale, Element r
 }
 
 template <typename Element>
+CUTLASS_DEVICE Element unsafe_softmax_log2(Element x, Element lse) {
+  static_assert(std::is_same_v<Element, float>, "Only support float");
+  Element softmax_x = exp2f(x - lse);
+  return softmax_x;
+}
+
+template <typename Element>
 CUTLASS_DEVICE Element safe_softmax(Element x, Element lse) {
   static_assert(std::is_same_v<Element, float>, "Only support float");
   Element softmax_x = expf(safe_sub(x, lse));
   return softmax_x;
+}
+
+template <typename Element>
+CUTLASS_DEVICE Element softmax_backward(Element P, Element dP, Element dPsum) {
+  static_assert(std::is_same_v<Element, float>, "Only support float");
+  Element dS = P * (dP - dPsum);
+  return dS;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

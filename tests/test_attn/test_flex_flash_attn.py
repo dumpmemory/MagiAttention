@@ -122,6 +122,7 @@ class TestFlexFlashAttn(DistTestBase):
                 "deterministic",
                 "auto_range_merge",
                 "random_attn_type_map",
+                "swap_bwd_qk_loop",
                 "ref_block_config_idx",  # Use index instead of dict
                 "max_seqlen_q",
             ],
@@ -415,22 +416,25 @@ class TestFlexFlashAttn(DistTestBase):
             q_ranges=fwd_q_ranges,
             k_ranges=fwd_k_ranges,
             attn_type_map=fwd_attn_type_map,
+            softmax_scale=softmax_scale,
+            softcap=0.0,
+            out_type=torch.float32,
+            disable_fwd_atomic_reduction=False,
+            deterministic=deterministic,
+            sm_margin=0,
+            # optional args below mainly for sparse attn
+            ref_block_size=None,
+            max_seqlen_q=max_seqlen_q,
+            auto_range_merge=auto_range_merge,
             merge_q_ranges=merge_q_ranges,
             qk_map=fwd_qk_map,
             fwd_unique_count=fwd_unique_count,
+            swap_ab=False,
+            pack_gqa=pack_gqa,
+            sparse_load=False,
             sparse_load_loop_count=None,
             sparse_load_invalid_count=None,
             equal_k_range_size=None,
-            ref_block_size=None,
-            softmax_scale=softmax_scale,
-            softcap=0.0,
-            disable_fwd_atomic_reduction=False,
-            out_type=torch.float32,
-            deterministic=deterministic,
-            sm_margin=0,
-            max_seqlen_q=max_seqlen_q,
-            pack_gqa=pack_gqa,
-            sparse_load=False,
         )
 
         o_ref, lse_ref = correct_attn_fwd_result(
@@ -450,22 +454,25 @@ class TestFlexFlashAttn(DistTestBase):
             q_ranges=fwd_q_ranges,
             k_ranges=fwd_k_ranges,
             attn_type_map=fwd_attn_type_map,
+            softmax_scale=softmax_scale,
+            softcap=0.0,
+            out_type=None,
+            disable_fwd_atomic_reduction=False,
+            deterministic=deterministic,
+            sm_margin=0,
+            # optional args below mainly for sparse attn
+            ref_block_size=None,
+            max_seqlen_q=max_seqlen_q,
+            auto_range_merge=auto_range_merge,
             merge_q_ranges=merge_q_ranges,
             qk_map=fwd_qk_map,
             fwd_unique_count=fwd_unique_count,
+            swap_ab=False,
+            pack_gqa=pack_gqa,
+            sparse_load=False,
             sparse_load_loop_count=None,
             sparse_load_invalid_count=None,
             equal_k_range_size=None,
-            ref_block_size=None,
-            softmax_scale=softmax_scale,
-            softcap=0.0,
-            disable_fwd_atomic_reduction=False,
-            out_type=None,
-            deterministic=deterministic,
-            sm_margin=0,
-            max_seqlen_q=max_seqlen_q,
-            pack_gqa=pack_gqa,
-            sparse_load=False,
         )
 
         assert_close(
@@ -499,17 +506,14 @@ class TestFlexFlashAttn(DistTestBase):
             None,  # sink
             "sh",  # sink_layout
             o_ref.to(q.dtype),
+            lse_ref,
             None,  # dq
             None,  # dk
             None,  # dv
             None,  # dsink
-            lse_ref,
             bwd_q_ranges,
             bwd_k_ranges,
             bwd_attn_type_map,
-            merge_k_ranges,
-            bwd_kq_map,
-            bwd_unique_count,
             softmax_scale=softmax_scale,
             softcap=0.0,
             disable_bwd_dkv_atomic_reduction=False,  # TODO: test when it's `True`
@@ -518,6 +522,11 @@ class TestFlexFlashAttn(DistTestBase):
             dv_type=torch.float32,
             deterministic=deterministic,
             sm_margin=0,
+            auto_range_merge=auto_range_merge,
+            merge_k_ranges=merge_k_ranges,
+            bwd_kq_map=bwd_kq_map,
+            bwd_unique_count=bwd_unique_count,
+            swap_bwd_qk_loop=False,  # TODO: test when it's `True`
         )
 
         dq_ref += dq_acc
@@ -532,17 +541,14 @@ class TestFlexFlashAttn(DistTestBase):
             None,  # sink
             "sh",  # sink_layout
             o_ref.to(q.dtype),
+            lse_ref,
             dq_acc,  # dq
             dk_acc,  # dk
             dv_acc,  # dv
             None,  # dsink
-            lse_ref,
             bwd_q_ranges,
             bwd_k_ranges,
             bwd_attn_type_map,
-            merge_k_ranges,
-            bwd_kq_map,
-            bwd_unique_count,
             softmax_scale=softmax_scale,
             softcap=0.0,
             disable_bwd_dkv_atomic_reduction=False,  # TODO: test when it's `True`
@@ -551,6 +557,11 @@ class TestFlexFlashAttn(DistTestBase):
             dv_type=torch.float32,
             deterministic=deterministic,
             sm_margin=0,
+            auto_range_merge=auto_range_merge,
+            merge_k_ranges=merge_k_ranges,
+            bwd_kq_map=bwd_kq_map,
+            bwd_unique_count=bwd_unique_count,
+            swap_bwd_qk_loop=False,  # TODO: test when it's `True`
         )
 
         assert_close(
@@ -1549,6 +1560,7 @@ class TestFlexFlashAttn(DistTestBase):
         dtype: torch.dtype,
     ):
         # -----    switch env flags by FlagCombGenerator   ---- #
+
         flag_comb = next(self.flag_iterator)
         flag_comb_test_case = FlagCombGenerator.to_test_case(flag_comb)
 
@@ -1568,13 +1580,16 @@ class TestFlexFlashAttn(DistTestBase):
             f", but got {len(q_ranges)=}, {len(k_ranges)=}, {len(attn_type_map)=}"
         )
 
+        # extract flags
         test_accumulation_inplace = bool(
             flag_comb.get("test_accumulation_inplace", False)
         )
         deterministic = bool(flag_comb.get("deterministic", False))
         auto_range_merge = bool(flag_comb.get("auto_range_merge", False))
         random_attn_type_map = bool(flag_comb.get("random_attn_type_map", False))
-        # Extract ref_block_config from flag_comb using index
+        swap_bwd_qk_loop = bool(flag_comb.get("swap_bwd_qk_loop", False))
+        enable_max_seqlen_q = bool(flag_comb.get("max_seqlen_q", False))
+        # NOTE: we use ref_block_config_idx to extract ref_block_config since it is a non-hashable dict
         ref_block_config_idx = flag_comb.get("ref_block_config_idx", 0)
         ref_block_config = self.valid_ref_block_configs[ref_block_config_idx]
         swap_ab = ref_block_config["swap_ab"]
@@ -1582,12 +1597,21 @@ class TestFlexFlashAttn(DistTestBase):
         pack_gqa = ref_block_config["pack_gqa"]
         sparse_load = ref_block_config["sparse_load"]
 
+        # skip invalid flag combinations
+        if swap_bwd_qk_loop:
+            # TODO: support auto_range_merge mode with swap_bwd_qk_loop
+            if auto_range_merge:
+                return
+
+            # TODO: support deterministic mode with swap_bwd_qk_loop
+            if deterministic:
+                return
+
         if random_attn_type_map:
             # we now support attn type idx in {0, 1, 2, 3}
             attn_type_map = torch.randint(0, 4, (len(attn_type_map),)).tolist()
 
         # Calculate max_seqlen_q from q_ranges (maximum length of any q range)
-        enable_max_seqlen_q = bool(flag_comb.get("max_seqlen_q", False))
         max_seqlen_q = (
             q_ranges.max_seqlen
             if enable_max_seqlen_q and not q_ranges.is_empty()
@@ -1756,22 +1780,33 @@ class TestFlexFlashAttn(DistTestBase):
             f", but got {len(q_ranges)=}, {len(k_ranges)=}, {len(attn_type_map)=}"
         )
 
-        # Extract ref_block_config from flag_comb using index
+        # extract flags
+        test_accumulation_inplace = bool(
+            flag_comb.get("test_accumulation_inplace", False)
+        )
+        deterministic = bool(flag_comb.get("deterministic", False))
+        auto_range_merge = bool(flag_comb.get("auto_range_merge", False))
+        swap_bwd_qk_loop = bool(flag_comb.get("swap_bwd_qk_loop", False))
+        enable_max_seqlen_q = bool(flag_comb.get("max_seqlen_q", False))
+        # NOTE: we use ref_block_config_idx to extract ref_block_config since it is a non-hashable dict
         ref_block_config_idx = flag_comb.get("ref_block_config_idx", 0)
         ref_block_config = self.valid_ref_block_configs[ref_block_config_idx]
         swap_ab = ref_block_config["swap_ab"]
         ref_block_size = ref_block_config["ref_block_size"]
         pack_gqa = ref_block_config["pack_gqa"]
         sparse_load = ref_block_config["sparse_load"]
-        test_accumulation_inplace = bool(
-            flag_comb.get("test_accumulation_inplace", False)
-        )
 
-        deterministic = bool(flag_comb.get("deterministic", False))
-        auto_range_merge = bool(flag_comb.get("auto_range_merge", False))
+        # skip invalid flag combinations
+        if swap_bwd_qk_loop:
+            # TODO: support auto_range_merge mode with swap_bwd_qk_loop
+            if auto_range_merge:
+                return
+
+            # TODO: support deterministic mode with swap_bwd_qk_loop
+            if deterministic:
+                return
 
         # Calculate max_seqlen_q from q_ranges (maximum length of any q range)
-        enable_max_seqlen_q = bool(flag_comb.get("max_seqlen_q", False))
         max_seqlen_q = (
             q_ranges.max_seqlen
             if enable_max_seqlen_q and not q_ranges.is_empty()

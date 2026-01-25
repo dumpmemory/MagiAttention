@@ -904,6 +904,7 @@ class DistAttnRuntime:
 
     @property
     def fwd_kernel_barrier_fetch_target(self) -> int:
+        """The target number the kernel barrier should wait for during forward fetch"""
         if self.cp_group_gc.size() == 1 or not self.use_native_grpcoll:
             return 0
 
@@ -914,6 +915,7 @@ class DistAttnRuntime:
 
     @property
     def fwd_kernel_barrier_reduce_target(self) -> int:
+        """The target number the kernel barrier should wait for during forward reduce"""
         if self.cp_group_gc.size() == 1 or not self.use_native_grpcoll:
             return 0
 
@@ -924,6 +926,7 @@ class DistAttnRuntime:
 
     @property
     def bwd_kernel_barrier_fetch_target(self) -> int:
+        """The target number the kernel barrier should wait for during backward fetch"""
         if self.cp_group_gc.size() == 1 or not self.use_native_grpcoll:
             return 0
 
@@ -934,6 +937,7 @@ class DistAttnRuntime:
 
     @property
     def bwd_kernel_barrier_reduce_target(self) -> int:
+        """The target number the kernel barrier should wait for during backward reduce"""
         if self.cp_group_gc.size() == 1 or not self.use_native_grpcoll:
             return 0
 
@@ -1022,17 +1026,8 @@ class DistAttnRuntime:
                     out=out_acc,  # directly reduce to out_acc
                     lse=lse_acc,  # directly reduce to lse_acc
                     **attn_arg.to_ffa_args(is_bwd=False),
-                    merge_q_ranges=None,
-                    qk_map=None,
-                    fwd_unique_count=None,
-                    sparse_load_loop_count=None,
-                    sparse_load_invalid_count=None,
-                    equal_k_range_size=None,
-                    ref_block_size=None,
                     softmax_scale=softmax_scale,
-                    deterministic=self.deterministic,
                     softcap=softcap,
-                    sm_margin=self.fwd_sm_margin,
                     # NOTE: always use high-precision for the partial out,
                     # to reduce the error caused by the out/lse correction
                     out_type=self.hp_dtype,
@@ -1041,6 +1036,21 @@ class DistAttnRuntime:
                     disable_fwd_atomic_reduction=(
                         attn_arg.disable_fwd_atomic_reduction and out_acc is None
                     ),
+                    deterministic=self.deterministic,
+                    sm_margin=self.fwd_sm_margin,
+                    # optional args below mainly for sparse attn
+                    ref_block_size=None,
+                    max_seqlen_q=None,
+                    auto_range_merge=False,
+                    merge_q_ranges=None,
+                    qk_map=None,
+                    fwd_unique_count=None,
+                    swap_ab=False,
+                    pack_gqa=False,
+                    sparse_load=False,
+                    sparse_load_loop_count=None,
+                    sparse_load_invalid_count=None,
+                    equal_k_range_size=None,
                 )
 
         return partial_out, partial_lse
@@ -1111,20 +1121,23 @@ class DistAttnRuntime:
                 dk=partial_dk,
                 dv=partial_dv,
                 dsink=None,  # let kernel initialize dsink if required
+                **attn_arg.to_ffa_args(is_bwd=True),
+                softmax_scale=softmax_scale,
+                softcap=softcap,
                 # NOTE: always use high precision for the partial dq, dkv
                 # to reduce the error caused by the atomic reduction inside the kernel
                 dq_type=self.hp_dtype,
                 dk_type=self.hp_dtype,
                 dv_type=self.hp_dtype,
-                **attn_arg.to_ffa_args(is_bwd=True),
+                disable_bwd_dkv_atomic_reduction=attn_arg.disable_bwd_dkv_atomic_reduction,
+                deterministic=self.deterministic,
+                sm_margin=self.bwd_sm_margin,
+                # optional args below mainly for sparse attn
+                auto_range_merge=False,
                 merge_k_ranges=None,
                 bwd_kq_map=None,
                 bwd_unique_count=None,
-                softmax_scale=softmax_scale,
-                deterministic=self.deterministic,
-                softcap=softcap,
-                disable_bwd_dkv_atomic_reduction=attn_arg.disable_bwd_dkv_atomic_reduction,
-                sm_margin=self.bwd_sm_margin,
+                swap_bwd_qk_loop=False,
             )
 
             if not self.concat_dkv:  # make partial_dkv tupled tensors
@@ -1911,9 +1924,6 @@ class DistAttnRuntime:
             local_k: [num_heads_kv * num_tokens_kv_local, 1, head_dim]
             local_v: [num_heads_kv * num_tokens_kv_local, 1, head_dim]
         """
-        if not self.flatten_head_groups:
-            return local_q, local_kv
-
         assert isinstance(
             local_kv, tuple
         ), "local_kv should be tupled tensors for this API"
@@ -1923,16 +1933,19 @@ class DistAttnRuntime:
         self.num_heads_q = local_q.shape[1]
         self.num_heads_kv = local_kv[0].shape[1]
         assert self.num_heads_q % self.num_heads_kv == 0
-        self.heads_per_group = self.num_heads_q // self.num_heads_kv
+        self.num_heads_per_group = self.num_heads_q // self.num_heads_kv
+
+        if not self.flatten_head_groups:
+            return local_q, local_kv
 
         # Transpose local_q: flatten groups into sequence dimension
-        # [num_tokens, num_heads_q, head_dim] -> [num_heads_kv * num_tokens, heads_per_group, head_dim]
+        # [num_tokens, num_heads_q, head_dim] -> [num_heads_kv * num_tokens, num_heads_per_group, head_dim]
         # Order: Group 0 (all tokens), Group 1 (all tokens), ...
         local_q = rearrange(
             local_q,
             "n (g h) d -> (g n) h d",
             g=self.num_heads_kv,
-            h=self.heads_per_group,
+            h=self.num_heads_per_group,
         ).contiguous()
 
         # Transpose local_k and local_v: flatten groups (heads) into sequence dimension
@@ -1961,8 +1974,8 @@ class DistAttnRuntime:
             tuple[torch.Tensor, torch.Tensor]: maybe unflattened local out and local lse.
 
         Shape (before unflatten):
-            local_out: [num_heads_kv * num_tokens_q_local, heads_per_group, head_dim]
-            local_lse: [num_heads_kv * num_tokens_q_local, heads_per_group]
+            local_out: [num_heads_kv * num_tokens_q_local, num_heads_per_group, head_dim]
+            local_lse: [num_heads_kv * num_tokens_q_local, num_heads_per_group]
 
         Shape (after unflatten):
             local_out: [num_tokens_q_local, num_heads_q, head_dim]
@@ -1976,7 +1989,7 @@ class DistAttnRuntime:
             local_out,
             "(g n) h d -> n (g h) d",
             g=self.num_heads_kv,
-            h=self.heads_per_group,
+            h=self.num_heads_per_group,
         ).contiguous()
 
         # local_lse: [(g * n_q), h_per_group] -> [n_q, num_heads_q]
@@ -1984,7 +1997,7 @@ class DistAttnRuntime:
             local_lse,
             "(g n) h -> n (g h)",
             g=self.num_heads_kv,
-            h=self.heads_per_group,
+            h=self.num_heads_per_group,
         ).contiguous()
 
         return local_out, local_lse
@@ -2011,10 +2024,10 @@ class DistAttnRuntime:
             local_lse:  [num_tokens_q_local, num_heads_q]
 
         Shape (after flatten):
-            local_q: [num_heads_kv * num_tokens_q_local, heads_per_group, head_dim]
-            local_out: [num_heads_kv * num_tokens_q_local, heads_per_group, head_dim]
-            local_do: [num_heads_kv * num_tokens_q_local, heads_per_group, head_dim]
-            local_lse: [num_heads_kv * num_tokens_q_local, heads_per_group]
+            local_q: [num_heads_kv * num_tokens_q_local, num_heads_per_group, head_dim]
+            local_out: [num_heads_kv * num_tokens_q_local, num_heads_per_group, head_dim]
+            local_do: [num_heads_kv * num_tokens_q_local, num_heads_per_group, head_dim]
+            local_lse: [num_heads_kv * num_tokens_q_local, num_heads_per_group]
         """
         if not self.flatten_head_groups:
             return local_qo_do, local_lse
@@ -2030,7 +2043,7 @@ class DistAttnRuntime:
                 x,
                 "n (g h) d -> (g n) h d",
                 g=self.num_heads_kv,
-                h=self.heads_per_group,
+                h=self.num_heads_per_group,
             ).contiguous()
             for x in [local_out, local_do]
         ]
@@ -2041,7 +2054,7 @@ class DistAttnRuntime:
             local_lse,
             "n (g h) -> (g n) h",
             g=self.num_heads_kv,
-            h=self.heads_per_group,
+            h=self.num_heads_per_group,
         ).contiguous()
 
         return local_qo_do, local_lse
@@ -2063,7 +2076,7 @@ class DistAttnRuntime:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]: maybe unflattened local dq/kv/dsink.
 
         Shape (before unflatten):
-            local_dq: [num_heads_kv * num_tokens_q_local, heads_per_group, head_dim]
+            local_dq: [num_heads_kv * num_tokens_q_local, num_heads_per_group, head_dim]
             local_dk: [num_heads_kv * num_tokens_kv_local, 1, head_dim]
             local_dv: [num_heads_kv * num_tokens_kv_local, 1, head_dim]
 
@@ -2081,7 +2094,7 @@ class DistAttnRuntime:
             local_dq,
             "(g n) h d -> n (g h) d",
             g=self.num_heads_kv,
-            h=self.heads_per_group,
+            h=self.num_heads_per_group,
         )
 
         # local_dk/local_dv: [(num_heads_kv * n_kv), 1, d] -> [n_kv, num_heads_kv, d]

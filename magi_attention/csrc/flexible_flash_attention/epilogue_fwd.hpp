@@ -35,6 +35,8 @@
 namespace flash {
 
 using namespace cute;
+namespace gcd = cutlass::gemm::collective::detail;
+namespace ecd = cutlass::epilogue::collective::detail;
 
 template <
     class TileShape_MNK_PV_,
@@ -49,13 +51,16 @@ template <
     bool Deterministic_ = false,
     bool SwapAB_ = false>
 struct CollectiveEpilogueFwd {
-  // KblockM, Kheaddim, KblockN
   using TileShape_MNK_PV = TileShape_MNK_PV_;
   using ClusterShape = ClusterShape_;
   using Element = Element_;
   using ElementPartial = float;
   using ArchTag = ArchTag_;
   using BlockCoordType = BlockCoordType_;
+  using resv_barrier = cutlass::arch::ReservedNamedBarriers;
+
+  // Sanity check
+  static_assert(ArchTag::kMinComputeCapability >= 90 || CUTE_STATIC_V(size(ClusterShape{})) == 1);
 
   static constexpr int NumEpilogueThreads = NumEpilogueThreads_;
   static constexpr bool DisableFwdAtomicReduction = DisableFwdAtomicReduction_;
@@ -64,19 +69,18 @@ struct CollectiveEpilogueFwd {
   static constexpr bool Deterministic = Deterministic_;
   static constexpr bool SwapAB = SwapAB_;
 
-  static_assert(ArchTag::kMinComputeCapability >= 90 || CUTE_STATIC_V(size(ClusterShape{})) == 1);
-  // static_assert(sizeof(Element) <= 2);
-
   static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
   static constexpr int kHeadDim = get<1>(TileShape_MNK_PV{});
+  static constexpr int kBlockN = get<2>(TileShape_MNK_PV{});
 
   // when SwapAB == true, set the warp group overlap tileMMA size for kBlockM
   static constexpr int TileSize_kBlockM = kBlockM;
   // TileSize_kBlockM can be set as kBlockM/2 to enable two warp-group inter overlap, but now is disable because no gain.
   // static constexpr int TileSize_kBlockM = kBlockM == 8 ? kBlockM : kBlockM / 2;
 
-  // TileShape_MNK_SwapAB_OP_SELECT use TileSize_kBlockM as n, which use in tensor core ss_op_selector for inter warp group overlap (splitting short q range when SwapAB
-  // is open).
+  // TileShape_MNK_SwapAB_OP_SELECT use TileSize_kBlockM as n,
+  // which use in tensor core ss_op_selector for inter warp group overlap
+  // (splitting short q range when SwapAB is open).
   using TileShape_MNK_PV_SwapAB_OP_SELECT = Shape<Int<kHeadDim>, Int<TileSize_kBlockM>, decltype(get<2>(TileShape_MNK_PV{}))>;
 
   using TileShape_MNK_PV_Active = std::conditional_t<SwapAB, TileShape_MNK_PV_SwapAB_OP_SELECT, TileShape_MNK_PV>;
@@ -91,8 +95,7 @@ struct CollectiveEpilogueFwd {
   // in the M direction and 2 elements in the K direction. In the case of PackGQA, this reduces the number of times
   // we need to call divmod.
 
-  // The "Row" below refers to a Head.
-  // Bytes per head
+  // The "Row" below refers to a Head. Bytes per head
   static constexpr int kBytePerRow = kHeadDim * sizeof(Element);
   // Number of (128-byte, 64-byte, or 32-byte) blocks per head
   static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
@@ -118,8 +121,7 @@ struct CollectiveEpilogueFwd {
       decltype(make_tiled_copy(GmemTileCopyAtomO{}, GmemLayoutAtom{}, Layout<Shape<_1, Int<kGmemElemsPerStore>>>{})); // Val layout, 8 or 16 vals per store
 
   using SmemLayoutAtomOTMA =
-      decltype(cutlass::gemm::collective::detail::
-                   ss_smem_selector<GMMA::Major::K, Element, decltype(cute::get<0>(TileShape_MNK_PV{})), decltype(cute::get<1>(TileShape_MNK_PV{}))>());
+      decltype(gcd::ss_smem_selector<GMMA::Major::K, Element, decltype(cute::get<0>(TileShape_MNK_PV{})), decltype(cute::get<1>(TileShape_MNK_PV{}))>());
   using SmemLayoutOTMA = decltype(tile_to_shape(SmemLayoutAtomOTMA{}, select<0, 1>(TileShape_MNK_PV{})));
   static constexpr int kSwizzle = sizeof(Element) == 4 ? 2 : (kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1)));
   static constexpr int kSwizzleBase = sizeof(Element) == 4 ? 3 : (sizeof(Element) == 2 ? 3 : 4);
@@ -150,7 +152,7 @@ struct CollectiveEpilogueFwd {
   using CopyOpR2S = std::conditional_t<
       ArchTag::kMinComputeCapability >= 90,
       // cute::SM90_U32x4_STSM_N if Element size is 2 bytes (fp16, bf16)
-      decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, ElementPartial>()),
+      decltype(ecd::sm90_get_smem_store_op_for_accumulator<StrideO, ElementPartial>()),
       AutoVectorizingCopyWithAssumedAlignment<128>>;
 
   // static constexpr size_t SmemAlignmentO = cutlass::detail::alignment_for_swizzle(SmemLayoutO{});
@@ -243,7 +245,7 @@ struct CollectiveEpilogueFwd {
         args.determin_range_locks};
   }
 
-  /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
+  // Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
   CUTLASS_DEVICE
   static void prefetch_tma_descriptors(Params const& params) {
     // cute::prefetch_tma_descriptor(params.tma_store_O.get_tma_descriptor());
@@ -271,8 +273,8 @@ struct CollectiveEpilogueFwd {
     if (need_second_lock) {
       int index_2 = block_idx2 * num_heads + bidh;
 
-// Try to acquire the second lock
 #pragma unroll 1
+      // Try to acquire the second lock
       while (atomicCAS(&range_lock[index_2], 0, 1) != 0) {
         // Temporarily release the first lock to avoid deadlock
         // atomicExch(&range_lock[index_1], 0);
@@ -323,8 +325,8 @@ struct CollectiveEpilogueFwd {
     int left_range_index = left_range_block_idx * num_heads + bidh;
     int right_range_block_idx = (offset + q_block_size - 1) / q_block_size;
 
-// Acquire the first lock
 #pragma unroll 1
+    // Acquire the first lock
     while (atomicCAS(&range_lock[left_range_index * 2], left_range_sync_num, left_range_sync_num) != left_range_sync_num) {
     }
 
@@ -332,8 +334,8 @@ struct CollectiveEpilogueFwd {
     if (left_range_block_idx != right_range_block_idx) {
       int right_range_index = right_range_block_idx * num_heads + bidh;
 
-// Try to acquire the second lock
 #pragma unroll 1
+      // Try to acquire the second lock
       while (atomicCAS(&range_lock[right_range_index * 2], right_range_sync_num, right_range_sync_num) != right_range_sync_num) {
       }
     }
@@ -393,7 +395,7 @@ struct CollectiveEpilogueFwd {
     int seqlen_o = seqlen_info.seqlen_q;
 
     // Get warp group index for current thread
-    int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
+    int warp_group_idx = warp_uniform(thread_idx / cutlass::NumThreadsPerWarpGroup);
 
     // Define Tensors for mO, gO, sO
     Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O), params.shape_O, params.stride_O)(_, _, bidh);
@@ -443,7 +445,7 @@ struct CollectiveEpilogueFwd {
     // Technically we don't need this if we're not using smem, but the mainloop makes the assumption that
     // all epilogue threads sync at least once during the epilogue (so that we can start loading Q with
     // cp.async if we need).
-    flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    BarrierManager::sync<NumEpilogueThreads>(resv_barrier::EpilogueBarrier);
 
     // Step 2: Write LSE from rmem -> gmem
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
@@ -485,7 +487,7 @@ struct CollectiveEpilogueFwd {
         }
         acquire_lock(params.range_locks, bidh, offset_o * Qhead_per_khead + m_block * kBlockM, kBlockM, !PackGQA ? params.nheads : params.nheads_kv);
       }
-      flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+      BarrierManager::sync<NumEpilogueThreads>(resv_barrier::EpilogueBarrier);
 
 #pragma unroll
       for (int mi = 0; mi < size(lse_prev); ++mi) {
@@ -519,7 +521,7 @@ struct CollectiveEpilogueFwd {
       }
 
       // A workaround to ensure that all threads get the correct lse_final, low performance
-      flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+      BarrierManager::sync<NumEpilogueThreads>(resv_barrier::EpilogueBarrier);
     } else {
       // If we don't use atomic reduction, we can just use lse directly
       for (int mi = 0; mi < size(lse_final); ++mi) {
@@ -657,7 +659,7 @@ struct CollectiveEpilogueFwd {
       }();
       // Tensor tOsO = thr_copy_O.partition_D(sO_pi);
       cute::copy(tiled_copy_O, tOrO_copy_view, tOsO);
-      flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+      BarrierManager::sync<NumEpilogueThreads>(resv_barrier::EpilogueBarrier);
     }
 
     // Copy tOsO to tOrFinalO
@@ -675,11 +677,10 @@ struct CollectiveEpilogueFwd {
     }
 
     // cutlass::arch::fence_view_async_shared();
-    // flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-    // int warp_idx_sync = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarp, 0);
+    // BarrierManager::sync<NumEpilogueThreads>(resv_barrier::EpilogueBarrier);
+    // int warp_idx_sync = warp_uniform(thread_idx / cutlass::NumThreadsPerWarp);
     // if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
-    //     // cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
-    //     //                                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier)
+    //    // BarrierManager::sync<NumEpilogueThreads + cutlass::NumThreadsPerWarp>(resv_barrier::EpilogueBarrier);
     //     if (cute::elect_one_sync()) {
     //         #pragma unroll
     //         for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
@@ -702,7 +703,7 @@ struct CollectiveEpilogueFwd {
     // {
     //     // TODO: move the following code out of braces
     //     cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
-    //     flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    //     BarrierManager::sync<NumEpilogueThreads>(resv_barrier::EpilogueBarrier);
 
     //     Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O)(_, _, bidh);
     //     Tensor gO = local_tile(cute::domain_offset(make_coord(offset_o, _0{}), mO), select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));
@@ -710,10 +711,9 @@ struct CollectiveEpilogueFwd {
     //     Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
     //     Tensor tOsO = block_tma_O.partition_S(sO); // (TMA, TMA_M, TMA_K)
 
-    //     int warp_idx_sync = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarp, 0);
+    //     int warp_idx_sync = warp_uniform(thread_idx / cutlass::NumThreadsPerWarp);
     //     if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
-    //         // cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
-    //         //                                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    //        // BarrierManager::sync<NumEpilogueThreads + cutlass::NumThreadsPerWarp>(resv_barrier::EpilogueBarrier);
     //         if (cute::elect_one_sync()) {
     //             cute::copy(params.tma_store_O, tOsO, tOgO);
     //             tma_store_arrive();
@@ -729,7 +729,7 @@ struct CollectiveEpilogueFwd {
     if constexpr (!DisableFwdAtomicReduction) {
       // Make sure all writes to global memory before this point are completed
       __threadfence();
-      flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+      BarrierManager::sync<NumEpilogueThreads>(resv_barrier::EpilogueBarrier);
       if (thread_idx == 0) {
         if constexpr (Deterministic) {
           int left_range_conflict_msg = get<3>(block_coord);
@@ -835,7 +835,7 @@ struct CollectiveEpilogueFwd {
         }
       }
     }
-    flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    BarrierManager::sync<NumEpilogueThreads>(resv_barrier::EpilogueBarrier);
   }
 };
 

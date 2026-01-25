@@ -33,6 +33,9 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+#include <cutlass/pipeline/pipeline.hpp>
+
+#include <cute/tensor.hpp>
 
 #include "cuda_check.h"
 
@@ -270,7 +273,7 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
       gemm<zero_init, wg_wait, SwapAB, /*M_slice=*/-1>(tiled_mma, tCrA, tCrB_slice, tCrC_slice);
     }
   } else {
-    constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
+    constexpr bool Is_RS = !cute::is_base_of<GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
     // Need to cast away const on tCrA since warpgroup_fence_operand doesn't take const
     if constexpr (Is_RS) {
       if constexpr (!SwapAB) {
@@ -795,8 +798,25 @@ CUTLASS_DEVICE auto calculate_dtanh(Tensor<Engine, Layout>& tensor) {
   return out;
 }
 
+template <typename Element>
+CUTLASS_DEVICE static constexpr auto sizeof_bytes_v() {
+  return cutlass::sizeof_bits_v<Element> / 8;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Broadcast a value from a source lane to all lanes in the warp
+template <class T>
+CUTE_DEVICE T broadcast_in_warp(T val, int src_lane = 0) {
+  return __shfl_sync(0xffffffff, val, src_lane);
+}
+
+// Count number of lanes in the warp where predicate is true
+CUTE_DEVICE int count_in_warp(int predicate) {
+  return __popc(__ballot_sync(0xffffffff, predicate));
+}
+
+// Inclusive prefix sum within a warp
 template <class T>
 CUTE_DEVICE T warp_prefix_sum(T val) {
   int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
@@ -810,19 +830,87 @@ CUTE_DEVICE T warp_prefix_sum(T val) {
   return val;
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
+// Get a uniform value across the warp by broadcasting from lane 0
 template <class T>
 CUTE_DEVICE T warp_uniform(T a) {
-  return __shfl_sync(0xffffffff, a, 0);
+  return broadcast_in_warp(a, /*src_lane=*/0);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 CUTLASS_DEVICE
+int canonical_thread_idx_in_warpgroup_nosync() {
+  return threadIdx.x % cutlass::NumThreadsPerWarpGroup;
+}
+
+CUTLASS_DEVICE
+int canonical_thread_idx_in_warpgroup_sync() {
+  return warp_uniform(canonical_thread_idx_in_warpgroup_nosync());
+}
+
+CUTLASS_DEVICE
+int canonical_warp_idx_in_warpgroup_nosync() {
+  return threadIdx.x / cutlass::NumThreadsPerWarp % cutlass::NumWarpsPerWarpGroup;
+}
+
+CUTLASS_DEVICE
+int canonical_warp_idx_in_warpgroup_sync() {
+  return warp_uniform(canonical_warp_idx_in_warpgroup_nosync());
+}
+
+CUTLASS_DEVICE
 int canonical_warp_group_idx_nosync() {
   return threadIdx.x / cutlass::NumThreadsPerWarpGroup;
 }
+
+CUTLASS_DEVICE
+int canonical_warp_group_idx_sync() {
+  return warp_uniform(canonical_warp_group_idx_nosync());
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Synchronize all threads in a cooperative group (CGA)
+// or fall back to `__syncthreads()` for single-block cluster (i.e. normal CTA)
+template <typename ClusterShape>
+CUTLASS_DEVICE void sync_cga_threads() {
+  if constexpr (size(ClusterShape{}) > 1) {
+    cute::cluster_arrive_relaxed();
+    cute::cluster_wait();
+  } else {
+    __syncthreads();
+  }
+}
+
+// Get TMA multi-cast load metadata: multicast mask and cluster block ID
+// RowwiseMask=true: multicast along M (x dim) mode for this N (y dim) load
+// RowwiseMask=false: multicast along N (y dim) mode for this M (x dim) load
+template <typename ClusterShape, typename GmemTiledCopy, bool RowwiseMask = true>
+CUTLASS_DEVICE cute::tuple<uint16_t, uint32_t> get_tma_multi_cast_meta() {
+  uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+  constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
+  uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
+
+  uint32_t cluster_block_id = RowwiseMask ? cluster_local_block_id.x : cluster_local_block_id.y;
+
+  uint16_t mcast_mask = 0;
+  if constexpr (cute::is_same_v<GmemTiledCopy, SM90_TMA_LOAD_MULTICAST>) {
+    auto block_layout = Layout<ClusterShape>{}; // (m,n) -> block_id
+    if constexpr (RowwiseMask) {
+      for (int m = 0; m < size<0>(block_layout); ++m) {
+        mcast_mask |= (uint16_t(1) << block_layout(m, cluster_local_block_id.y, _0{}));
+      }
+    } else {
+      for (int n = 0; n < size<1>(block_layout); ++n) {
+        mcast_mask |= (uint16_t(1) << block_layout(cluster_local_block_id.x, n, _0{}));
+      }
+    }
+  }
+
+  return {mcast_mask, cluster_block_id};
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 CUTLASS_DEVICE
 void cp_async_cacheglobal_l2_prefetch_256B(const void* src, void* dst, bool pred, int64_t cache_policy) {
