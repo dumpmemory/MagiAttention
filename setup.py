@@ -140,6 +140,34 @@ def get_cuda_bare_metal_version(cuda_dir) -> tuple[str, Version]:
     return raw_output, bare_metal_version
 
 
+def get_device_compute_capability(with_minor: bool = True, with_a: bool = False) -> str:
+    """Get the compute capability of the current CUDA device.
+    Example: '80', '90', '100', etc.
+
+    Args:
+        with_minor (bool): Whether to include the minor version in the output.
+            Defaults to ``True``.
+        with_a (bool): Whether to append 'a' suffix to the capability.
+            Defaults to ``False``.
+
+    Returns:
+        str: The compute capability of the current CUDA device.
+    """
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        if with_minor:  # include minor version, like 90, 100, 103
+            capability = f"{major}{minor}"
+        else:  # only major version with minor as 0, like 90, 100
+            capability = f"{major}0"
+
+        if with_a:  # include suffix 'a' like 90a, 100a
+            capability += "a"
+    else:
+        raise RuntimeError("CUDA device is not available to get compute capability")
+
+    return capability
+
+
 # Copied from https://github.com/deepseek-ai/DeepEP/blob/main/setup.py
 # Wheel specific: The wheels only include the soname of the host library (libnvshmem_host.so.X)
 def get_nvshmem_host_lib_name():
@@ -299,6 +327,12 @@ def build_magi_attn_comm_module(
     This module handles communication primitives (likely for distributed attention),
     leveraging NVSHMEM for efficient GPU-to-GPU data movement.
     """
+    # NOTE: we've found the compilation fails with `sm103`
+    # thus we only use the major version with minor as `0`,
+    # i.e. only `sm80`, `sm90`, `sm100`, etc.
+    capability = get_device_compute_capability(with_minor=False, with_a=False)
+
+    # ---   for grpcoll submodule   --- #
 
     # NVSHMEM Detection Logic
     # NVSHMEM is a library that allows GPUs to communicate directly.
@@ -416,9 +450,8 @@ def build_magi_attn_comm_module(
         "-std=c++17",  # Use C++17 standard
         "-lineinfo",  # Generate line-number information for profiling
         "-gencode",
-        "arch=compute_90,code=sm_90",  # Target NVIDIA Hopper architecture (H100)
-        # "-Xcompiler",  # for profiling compilation time
-        # "-ftime-report",  # for profiling compilation time
+        # Explicitly specify for current device compute capability
+        f"arch=compute_{capability},code=sm_{capability}",
     ]
 
     # Initialize lists for linking configuration
@@ -430,9 +463,21 @@ def build_magi_attn_comm_module(
     # If the base 'magi_attn_ext' library exists, link against it.
     ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
     magi_attn_ext_lib = repo_dir / PACKAGE_NAME / f"magi_attn_ext{ext_suffix}"
+
     if magi_attn_ext_lib.exists():
-        extra_link_args.append(str(magi_attn_ext_lib))
-        # Set RPATH to $ORIGIN so the loader finds the dependency in the same directory at runtime
+        # 1. Add the directory containing the library to the linker search path
+        lib_dir = str(magi_attn_ext_lib.parent)
+        extra_link_args.append(f"-L{lib_dir}")
+
+        # 2. Link against the specific filename instead of the absolute path.
+        # Using '-l::filename' (or '-l:filename') ensures the linker records
+        # only the filename in the 'DT_NEEDED' section of the ELF header,
+        # avoiding hardcoded absolute paths from the build environment.
+        extra_link_args.append(f"-l:{magi_attn_ext_lib.name}")
+
+        # 3. Set RPATH to $ORIGIN so the loader looks for dependencies in
+        # the same directory as the extension at runtime.
+        # Use '\$ORIGIN' to prevent the shell or compiler from expanding it as a variable.
         extra_link_args.append("-Wl,-rpath,$ORIGIN")
 
     # NVSHMEM Configuration (Conditional)

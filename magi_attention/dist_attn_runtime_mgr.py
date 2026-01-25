@@ -60,13 +60,16 @@ class DistAttnRuntimeKey:
     cp_group: dist.ProcessGroup
     cp_mesh: DeviceMesh | None
     dist_attn_config: DistAttnConfig
+    num_heads_q: int
+    num_heads_kv: int
+    # flags that might influence the runtime behavior
     is_deterministic_mode_enable: bool
     is_hierarchical_comm_enable: bool
     is_qo_comm_enable: bool
     is_native_grpcoll_enable: bool
     is_flatten_head_groups_enable: bool
-    num_heads_q: int
-    num_heads_kv: int
+    is_sdpa_backend_enable: bool
+    is_fa4_backend_enable: bool
 
 
 class DistAttnRuntimeMgr:
@@ -358,6 +361,23 @@ def check_flag_comb() -> None:
             not magi_attention.is_deterministic_mode_enable()
         ), "Native grpcoll is not compatible with deterministic mode for now"
 
+    if (
+        magi_attention.is_fa4_backend_enable()
+        and not magi_attention.is_sdpa_backend_enable()
+    ):
+        assert (  # TODO
+            not magi_attention.is_deterministic_mode_enable()
+        ), "FA4 backend is not compatible with deterministic mode for now"
+
+        assert (  # TODO
+            not magi_attention.comm.is_fwd_high_precision_reduce_enable()
+            and not magi_attention.comm.is_bwd_high_precision_reduce_enable()
+        ), "FA4 backend is not compatible with high-precision reduce for now"
+
+        assert (  # TODO
+            not magi_attention.comm.is_qo_comm_enable()
+        ), "FA4 backend is not compatible with qo comm for now"
+
 
 def init_dist_attn_runtime_key(
     q_ranges: AttnRanges,
@@ -373,6 +393,9 @@ def init_dist_attn_runtime_key(
     num_heads_q: int,
     num_heads_kv: int,
 ) -> DistAttnRuntimeKey:
+    """Initialize DistAttnRuntimeKey"""
+
+    # Check if flag combinations are valid
     check_flag_comb()
 
     return DistAttnRuntimeKey(
@@ -386,14 +409,16 @@ def init_dist_attn_runtime_key(
         cp_group=cp_group,
         cp_mesh=cp_mesh,
         dist_attn_config=dist_attn_config,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
         # auto set other flags that might influence the runtime behavior
         is_deterministic_mode_enable=magi_attention.is_deterministic_mode_enable(),
         is_hierarchical_comm_enable=magi_attention.comm.is_hierarchical_comm_enable(),
         is_qo_comm_enable=magi_attention.comm.is_qo_comm_enable(),
         is_native_grpcoll_enable=magi_attention.comm.is_native_grpcoll_enable(),
         is_flatten_head_groups_enable=magi_attention.is_flatten_head_groups_enable(),
-        num_heads_q=num_heads_q,
-        num_heads_kv=num_heads_kv,
+        is_sdpa_backend_enable=magi_attention.is_sdpa_backend_enable(),
+        is_fa4_backend_enable=magi_attention.is_fa4_backend_enable(),
     )
 
 

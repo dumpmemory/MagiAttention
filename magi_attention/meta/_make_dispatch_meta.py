@@ -92,13 +92,13 @@ def make_dispatch_meta_from_qk_ranges(
 
     # --------------      pre-check args       -------------- #
 
-    assert (
+    assert cp_size == 1 or (
         total_seqlen_q % chunk_size == 0 and total_seqlen_k % chunk_size == 0
     ), f"Both {total_seqlen_q=} and {total_seqlen_k=} should be divisible by {chunk_size=}."
 
     num_chunks_q = total_seqlen_q // chunk_size
     num_chunks_k = total_seqlen_k // chunk_size
-    assert (
+    assert cp_size == 1 or (
         num_chunks_q % cp_size == 0 and num_chunks_k % cp_size == 0
     ), f"Both {num_chunks_q=} and {num_chunks_k=} should be divisible by {cp_size=}."
 
@@ -249,6 +249,14 @@ def _make_self_attn_dispatch_meta_from_qk_ranges(
     shard_seqlen = shard_seqlen_q
     max_valid_ids = max_valid_ids_q
 
+    # -------    cp1 shortcut   ------- #
+
+    if cp_size == 1:
+        return _make_self_attn_dispatch_meta_from_qk_ranges_cp1(
+            total_seqlen=total_seqlen,
+            max_valid_ids=max_valid_ids,
+        )
+
     # -------    make global bucket   ------- #
 
     q_ranges, k_ranges, attn_mask_type = _sort_qk_ranges_and_mask_type(
@@ -318,6 +326,48 @@ def _make_self_attn_dispatch_meta_from_qk_ranges(
         cp_size=cp_size,
         chunk_size=chunk_size,
         num_chunks=num_chunks,
+        partitions=partitions,
+        partitions_perm_idxs=partitions_perm_idxs,
+        partitions_unperm_idxs=partitions_unperm_idxs,
+    )
+
+    dispatch_meta_q = DispatchMeta(
+        attn_role=AttnRole.QUERY,
+        **common_meta_kwargs,  # type: ignore
+    )
+    dispatch_meta_k = DispatchMeta(
+        attn_role=AttnRole.KEY,
+        **common_meta_kwargs,  # type: ignore
+    )
+
+    return dispatch_meta_q, dispatch_meta_k
+
+
+def _make_self_attn_dispatch_meta_from_qk_ranges_cp1(
+    total_seqlen: int,
+    max_valid_ids: int,
+) -> tuple[DispatchMeta, DispatchMeta]:
+    """Make dispatch meta from query and key ranges for self-attn settings
+    specific for cp_size=1 as a shortcut to reduce CPU overhead
+
+    NOTE: since cp_size=1, it is no use to do load balancing and chunk partitioning
+    thus we just hard-code the dispatch meta here, with chunk_size=total_seqlen,
+    then only a trivial partition returns including a single chunk
+    """
+
+    partitions: list[list[int]] = [[0]]
+    partitions_perm_idxs: list[int] = [0]
+    partitions_unperm_idxs: list[int] = [0]
+
+    common_meta_kwargs = dict(
+        attn_type=AttnType.SELF_ATTN,
+        total_seqlen=total_seqlen,
+        shard_seqlen=total_seqlen,
+        max_valid_ids=max_valid_ids,
+        cp_rank=0,
+        cp_size=1,
+        chunk_size=total_seqlen,
+        num_chunks=1,
         partitions=partitions,
         partitions_perm_idxs=partitions_perm_idxs,
         partitions_unperm_idxs=partitions_unperm_idxs,

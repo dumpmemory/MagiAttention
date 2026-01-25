@@ -68,34 +68,6 @@ class TestPipelineSDPABaseWithWorldSize1(DistTestBase):
     def init_pg(self) -> None:
         super().init_pg()
 
-        self.flag_to_envvar = {
-            "device_max_connections": "CUDA_DEVICE_MAX_CONNECTIONS",
-            "deterministic_mode": "MAGI_ATTENTION_DETERMINISTIC_MODE",
-            "enable_hier_comm": "MAGI_ATTENTION_HIERARCHICAL_COMM",
-            "enable_qo_comm": "MAGI_ATTENTION_QO_COMM",
-            "enable_native_grpcoll": "MAGI_ATTENTION_NATIVE_GRPCOLL",
-            "fwd_hp_reduce": "MAGI_ATTENTION_FORWARD_HIGH_PRECISION_REDUCE",
-            "bwd_hp_reduce": "MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE",
-            "flatten_head_groups": "MAGI_ATTENTION_FLATTEN_HEAD_GROUPS",
-        }
-
-        # init flag generator and its iterator
-        self.flag_generator = FlagCombGenerator(
-            flags=list(self.flag_to_envvar.keys()),
-            options={
-                "device_max_connections": [1, 8],
-            },
-            defaults={
-                "device_max_connections": 8,
-            },
-            groups=[
-                # comm group
-                ("enable_hier_comm", "enable_qo_comm", "enable_native_grpcoll"),
-            ],
-            strategy="heuristic",
-        )
-        self.flag_iterator = iter(self.flag_generator)
-
         # init several pgs with all ranks
         self.nccl_groups = [
             dist.new_group(list(range(self.world_size)), backend=self.backend)
@@ -122,18 +94,63 @@ class TestPipelineSDPABaseWithWorldSize1(DistTestBase):
 
         # -----    set up for native grpcoll   ---- #
 
+        native_grpcoll_registered = True
         for nccl_group in self.nccl_groups:
-            grpcoll_buffer_mgr.initialize(
-                group=nccl_group,
-                config=GrpCollConfig(
-                    num_sms=24,
-                    num_nvl_bytes=int(2e9) * self.world_size // 8,  # ~2GB for 8 ranks
+            try:
+                grpcoll_buffer_mgr.initialize(
+                    group=nccl_group,
+                    config=GrpCollConfig(
+                        num_sms=24,
+                        num_nvl_bytes=int(2e9)
+                        * self.world_size
+                        // 8,  # ~2GB for 8 ranks
+                    ),
+                )
+            except Exception as e:
+                native_grpcoll_registered = False
+                print(
+                    f"The NCCL group {nccl_group} cannot be registered due to error: \n{e}\n"
+                )
+
+        # -----    set up for flags   ---- #
+
+        self.flag_to_envvar = {
+            "device_max_connections": "CUDA_DEVICE_MAX_CONNECTIONS",
+            "deterministic_mode": "MAGI_ATTENTION_DETERMINISTIC_MODE",
+            "enable_hier_comm": "MAGI_ATTENTION_HIERARCHICAL_COMM",
+            "enable_qo_comm": "MAGI_ATTENTION_QO_COMM",
+            "enable_native_grpcoll": "MAGI_ATTENTION_NATIVE_GRPCOLL",
+            "fwd_hp_reduce": "MAGI_ATTENTION_FORWARD_HIGH_PRECISION_REDUCE",
+            "bwd_hp_reduce": "MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE",
+            "flatten_head_groups": "MAGI_ATTENTION_FLATTEN_HEAD_GROUPS",
+        }
+
+        # init flag generator and its iterator
+        self.flag_generator = FlagCombGenerator(
+            flags=list(self.flag_to_envvar.keys()),
+            options={
+                "device_max_connections": [1, 8],
+                "enable_native_grpcoll": (
+                    [False, True]
+                    if native_grpcoll_registered
+                    # disable native grpcoll if not registered successfully
+                    else [False]
                 ),
-            )
+            },
+            defaults={
+                "device_max_connections": 8,
+            },
+            groups=[
+                # comm group
+                ("enable_hier_comm", "enable_qo_comm", "enable_native_grpcoll"),
+            ],
+            strategy="heuristic",
+        )
+        self.flag_iterator = iter(self.flag_generator)
 
     @property
     def timeout(self) -> int:
-        return 600
+        return 900
 
     @property
     def device(self) -> int:

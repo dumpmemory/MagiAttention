@@ -31,9 +31,10 @@ from magi_attention.meta.collection import CalcMeta, CommMeta
 from magi_attention.meta.collection.calc_meta import AttnArg
 from magi_attention.utils import is_same_process_group, max_fp_dtype, nvtx
 
+from .fa4 import fa4_bwd, fa4_fwd
 from .flex_flash_attn import _flex_flash_attn_backward, _flex_flash_attn_forward
 from .sdpa import sdpa_bwd, sdpa_fwd
-from .utils import calc_lse_sink_compiled, correct_attn_fwd_result, sink_bwd_compiled
+from .utils import calc_lse_sink_compiled, correct_attn_out_lse, sink_bwd_compiled
 
 logger = getLogger(__name__)
 
@@ -82,15 +83,22 @@ class DistAttnRuntime:
 
         # ----------    other control flags for fwd   --------- #
 
-        # NOTE: we now always concat kv together for comm unless using native grpcoll
-        self.concat_kv = not self.use_native_grpcoll
+        # cp1 shortcut: skip all communication
+        self.skip_comm = cp_group_gc.size() == 1
+
+        # NOTE: concat kv together for comm only when not using native grpcoll and world_size > 1
+        self.concat_kv = (not self.skip_comm) and (not self.use_native_grpcoll)
 
         # NOTE: when disabling qo comm
-        # if not using sdpa backend,
+        # if not using sdpa backend and not using fa4 backend,
         # we will use accumulative buffer for partial out and lse
         # to avoid the storage of partial results
-        # and an additional explicit `correct_attn_fwd_result`
-        self.fwd_out_lse_use_acc = not self.enable_qo_comm and not self.use_sdpa_backend
+        # and an additional explicit `correct_attn_out_lse`
+        self.fwd_out_lse_use_acc = (
+            not self.enable_qo_comm
+            and not self.use_sdpa_backend
+            and not self.use_fa4_backend
+        )
 
         # NOTE: When enabling qo comm without native group collectives
         # or high-precision reduction, we must initialize the partial local output
@@ -111,18 +119,25 @@ class DistAttnRuntime:
 
         # ----------    other control flags for bwd   --------- #
 
-        # NOTE: we now always concat dkv together for comm unless using native grpcoll
-        self.concat_dkv = not self.use_native_grpcoll
+        # NOTE: concat dkv together for comm only when not using native grpcoll and world_size > 1
+        self.concat_dkv = (not self.skip_comm) and (not self.use_native_grpcoll)
 
-        # NOTE: when enabling qo comm
-        # we always concat q,o,do together for comm unless using native grpcoll
-        self.concat_qo_do = self.enable_qo_comm and not self.use_native_grpcoll
+        # NOTE: concat q,o,do together for comm only when enabling qo comm and not using native grpcoll and world_size > 1
+        self.concat_qo_do = (
+            self.enable_qo_comm
+            and (not self.skip_comm)
+            and (not self.use_native_grpcoll)
+        )
 
         # NOTE: when disabling qo comm
-        # if not using sdpa backend,
+        # if not using sdpa backend and not using fa4 backend,
         # we will use accumulative buffer for partial dq
         # to avoid an additional explicit `add_`
-        self.bwd_dq_use_acc = not self.enable_qo_comm and not self.use_sdpa_backend
+        self.bwd_dq_use_acc = (
+            not self.enable_qo_comm
+            and not self.use_sdpa_backend
+            and not self.use_fa4_backend
+        )
 
         # NOTE: when neither using native grpcoll nor enabling bwd high precision reduce
         # we're supposed to initialize the partial local dk,dv in low precision
@@ -838,6 +853,10 @@ class DistAttnRuntime:
         return magi_attention.is_sdpa_backend_enable()
 
     @property
+    def use_fa4_backend(self) -> bool:
+        return magi_attention.is_fa4_backend_enable()
+
+    @property
     def use_native_grpcoll(self) -> bool:
         return magi_attention.comm.is_native_grpcoll_enable()
 
@@ -1014,6 +1033,19 @@ class DistAttnRuntime:
                     softcap=softcap,
                     sink_layout="sh",
                 )
+            elif self.use_fa4_backend:
+                partial_out, partial_lse = fa4_fwd(
+                    q=q,
+                    k=k,
+                    v=v,
+                    # NOTE: sink token needs to be applied only once
+                    # thus we only apply it at the host stage if not skipped
+                    sink=sink if is_host_stage else None,
+                    attn_arg=attn_arg,
+                    softmax_scale=softmax_scale,
+                    softcap=softcap,
+                    sink_layout="sh",
+                )
             else:
                 partial_out, partial_lse = _flex_flash_attn_forward(
                     q=q,
@@ -1086,6 +1118,26 @@ class DistAttnRuntime:
                 softmax_scale=softmax_scale,
                 softcap=softcap,
                 sink_layout="sh",
+            )
+            partial_dkv = self._maybe_concat(
+                partial_dk, partial_dv, need_concat=self.concat_dkv
+            )
+        elif self.use_fa4_backend:
+            partial_dq, partial_dk, partial_dv, partial_dsink = fa4_bwd(
+                do=do,
+                q=q,
+                k=k,
+                v=v,
+                # NOTE: dsink should be computed only once
+                # thus we only compute it at the host stage if not skipped
+                sink=sink if is_host_stage else None,
+                o=o,
+                lse=lse,
+                attn_arg=attn_arg,
+                softmax_scale=softmax_scale,
+                softcap=softcap,
+                sink_layout="sh",
+                deterministic=self.deterministic,
             )
             partial_dkv = self._maybe_concat(
                 partial_dk, partial_dv, need_concat=self.concat_dkv
@@ -1556,10 +1608,12 @@ class DistAttnRuntime:
                 # NOTE: the partial remote out and lse have NOT been reduced to
                 # partial local out and lse by neither ffa fwd kernel nor group-reduce
                 # thus we need to manually reduce here
-                correct_attn_fwd_result(
-                    out_list=[partial_local_out, partial_remote_out],
-                    lse_list=[partial_local_lse, partial_remote_lse],
-                    inplace=True,  # inplace reduce to the partial local (first) out and lse
+                correct_attn_out_lse(
+                    out1=partial_local_out,
+                    lse1=partial_local_lse,
+                    out2=partial_remote_out,
+                    lse2=partial_remote_lse,
+                    inplace=True,  # inplace reduce to the partial local out and lse
                 )
 
             partial_out_lse_reduce_work = WorkWithPostProcessFn(
@@ -1620,7 +1674,9 @@ class DistAttnRuntime:
                 dtype=self._maybe_hp_dtype(
                     dtype,
                     # dkv always in high-precision if using native grpcoll
-                    need_hp_dtype=(self.use_native_grpcoll or self.bwd_hp_reduce),
+                    # unless using fa4 backend which only supports fp16/bf16 for now
+                    need_hp_dtype=(not self.use_fa4_backend)
+                    and (self.use_native_grpcoll or self.bwd_hp_reduce),
                 ),
                 device=device,
             )
@@ -1693,7 +1749,9 @@ class DistAttnRuntime:
                     dtype=self._maybe_hp_dtype(
                         ref_remote_dq.dtype,
                         # dq always in high-precision if using native grpcoll
-                        need_hp_dtype=(self.use_native_grpcoll or self.bwd_hp_reduce),
+                        # unless using fa4 backend which only supports fp16/bf16 for now
+                        need_hp_dtype=(not self.use_fa4_backend)
+                        and (self.use_native_grpcoll or self.bwd_hp_reduce),
                     ),
                 )
             elif not self.use_native_grpcoll and not self.bwd_hp_reduce:
@@ -1839,7 +1897,6 @@ class DistAttnRuntime:
             q,
             dtype=self._maybe_hp_dtype(q.dtype, not self.bwd_local_dq_lp_init),
         )
-
         dkv = torch.zeros(
             dkv_shape,
             dtype=self._maybe_hp_dtype(k.dtype, not self.bwd_local_dkv_lp_init),

@@ -270,6 +270,9 @@ class DistAttnSolver(BaseDistAttnSolver):
         self.host_q_ranges_global = host_q_ranges_global_this_rank
         self.host_k_ranges_global = host_k_ranges_global_this_rank
         self.remote_k_ranges_global = remote_k_ranges_global_this_rank
+        self.total_seqlen_q = dispatch_meta_q.total_seqlen
+        self.shard_seqlen_q = dispatch_meta_q.shard_seqlen
+        self.total_seqlen_k = dispatch_meta_k.total_seqlen
 
         # init host rank entry for this rank
         self.host_rank_entry_this_rank = self._init_host_rank_entry_this_rank(
@@ -280,6 +283,7 @@ class DistAttnSolver(BaseDistAttnSolver):
         )
 
         # init remote rank entry for each stage for this rank
+        # with the shape of [overlap_degree,]
         self.remote_rank_entry_per_stage_this_rank = (
             self._init_remote_rank_entry_per_stage_this_rank(
                 self.host_rank_entry_this_rank
@@ -287,6 +291,7 @@ class DistAttnSolver(BaseDistAttnSolver):
         )
 
         # init remote rank entry for each rank for each stage
+        # with the shape of [overlap_degree, cp_size]
         self.remote_rank_entry_per_rank_per_stage = (
             self._init_remote_rank_entry_per_rank_per_stage(
                 self.remote_rank_entry_per_stage_this_rank
@@ -294,6 +299,7 @@ class DistAttnSolver(BaseDistAttnSolver):
         )
 
         # init transfer table per stage
+        # with the shape of [overlap_degree,]
         self.transfer_table_per_stage: list[
             TransferTable
         ] = self._init_transfer_table_per_stage(
@@ -330,22 +336,33 @@ class DistAttnSolver(BaseDistAttnSolver):
         dispatch_meta_k: DispatchMeta,
         bucket_this_rank: AttnBucket,
     ) -> tuple[AttnRanges, AttnRanges, AttnRanges]:
-        # init host q_ranges global for this rank
-        host_q_ranges_global_this_rank = dispatch_meta_q.host_ranges_per_rank[
-            self.cp_rank
-        ].merge()
+        if self.cp_size == 1:  # cp1 shortcut
+            host_q_ranges_global_this_rank = AttnRanges.from_ranges(
+                [[0, dispatch_meta_q.total_seqlen]]
+            )
+            host_k_ranges_global_this_rank = AttnRanges.from_ranges(
+                [[0, dispatch_meta_k.total_seqlen]]
+            )
+            remote_k_ranges_global_this_rank = AttnRanges()
+        else:
+            # init host q_ranges global for this rank
+            host_q_ranges_global_this_rank = dispatch_meta_q.host_ranges_per_rank[
+                self.cp_rank
+            ].merge()
 
-        # init host k_ranges global for this rank
-        host_k_ranges_global_this_rank = dispatch_meta_k.host_ranges_per_rank[
-            self.cp_rank
-        ].merge()
+            # init host k_ranges global for this rank
+            host_k_ranges_global_this_rank = dispatch_meta_k.host_ranges_per_rank[
+                self.cp_rank
+            ].merge()
 
-        # init remote k_ranges global for this rank
-        # NOTE: this only contains the remote k ranges that we need to calculate from
-        remote_k_ranges_global_this_rank = bucket_this_rank.k_ranges.find_hole_ranges(
-            host_k_ranges_global_this_rank,
-            is_other_merged=True,
-        )
+            # init remote k_ranges global for this rank
+            # NOTE: this only contains the remote k ranges that we need to calculate from
+            remote_k_ranges_global_this_rank = (
+                bucket_this_rank.k_ranges.find_hole_ranges(
+                    host_k_ranges_global_this_rank,
+                    is_other_merged=True,
+                )
+            )
 
         # sanity check
         if magi_attention.is_sanity_check_enable():
@@ -384,6 +401,19 @@ class DistAttnSolver(BaseDistAttnSolver):
             # NOTE: we only chunk the remote k ranges
             remote_k_ranges_global=remote_k_ranges_global,
         )
+
+        # -------    cp1 shortcut   ------- #
+
+        if self.cp_size == 1:
+            return HostRankEntry(
+                host_q_ranges_global=host_q_ranges_global,
+                host_k_ranges_global=host_k_ranges_global,
+                attn_calc_slice_global_list=attn_calc_slice_global_list,
+                attn_calc_host_slice_local_list=attn_calc_slice_global_list,  # the same as global list
+                remote_k_ranges_global=remote_k_ranges_global,
+                remote_k_ranges_global_per_chunk=remote_k_ranges_global_per_chunk,  # empty list
+                attn_calc_remote_slice_list_per_chunk=[],  # empty list
+            )
 
         # -------   calc attn calc host q ranges local  ------ #
 
@@ -482,29 +512,32 @@ class DistAttnSolver(BaseDistAttnSolver):
         called in 'self._init_host_rank_entry_this_rank'
         """
 
-        # determine the chunk size constrainted by min_chunk_size and max_num_chunks
-        total_remote_k_seqlen = remote_k_ranges_global.total_seqlen
-        num_chunks = (
-            total_remote_k_seqlen + self.overlap_config.min_chunk_size - 1
-        ) // self.overlap_config.min_chunk_size
-        if num_chunks <= self.overlap_config.max_num_chunks:
-            self.overlap_chunk_size = self.overlap_config.min_chunk_size
-            self.overlap_num_chunks = num_chunks
+        if self.cp_size == 1:  # cp1 shortcut
+            self.overlap_num_chunks = 0
+            self.overlap_chunk_size = 0
+            remote_k_ranges_global_per_chunk: list[AttnRanges] = []  # empty list
         else:
-            self.overlap_num_chunks = self.overlap_config.max_num_chunks
-            self.overlap_chunk_size = (
-                total_remote_k_seqlen + self.overlap_num_chunks - 1
-            ) // self.overlap_num_chunks
-            self.overlap_num_chunks = (
-                total_remote_k_seqlen + self.overlap_chunk_size - 1
-            ) // self.overlap_chunk_size
+            # determine the chunk size constrainted by min_chunk_size and max_num_chunks
+            total_remote_k_seqlen = remote_k_ranges_global.total_seqlen
+            num_chunks = (
+                total_remote_k_seqlen + self.overlap_config.min_chunk_size - 1
+            ) // self.overlap_config.min_chunk_size
+            if num_chunks <= self.overlap_config.max_num_chunks:
+                self.overlap_chunk_size = self.overlap_config.min_chunk_size
+                self.overlap_num_chunks = num_chunks
+            else:
+                self.overlap_num_chunks = self.overlap_config.max_num_chunks
+                self.overlap_chunk_size = (
+                    total_remote_k_seqlen + self.overlap_num_chunks - 1
+                ) // self.overlap_num_chunks
+                self.overlap_num_chunks = (
+                    total_remote_k_seqlen + self.overlap_chunk_size - 1
+                ) // self.overlap_chunk_size
 
-        # chunk the remote k ranges global for multi-stage overlapping
-        remote_k_ranges_global_per_chunk: list[
-            AttnRanges
-        ] = remote_k_ranges_global.chunk(
-            self.overlap_chunk_size, check=magi_attention.is_sanity_check_enable()
-        )
+            # chunk the remote k ranges global for multi-stage overlapping
+            remote_k_ranges_global_per_chunk = remote_k_ranges_global.chunk(
+                self.overlap_chunk_size, check=magi_attention.is_sanity_check_enable()
+            )
 
         # sanity check
         if magi_attention.is_sanity_check_enable():
@@ -649,6 +682,12 @@ class DistAttnSolver(BaseDistAttnSolver):
     ) -> list[RemoteRankEntry]:
         """Initialize remote rank entry per overlap stage for this rank"""
 
+        # -------    cp1 shortcut   ------- #
+
+        if self.cp_size == 1:
+            self.overlap_degree = 0
+            return []
+
         # -------   calculate calc/comm cost pairs  ------ #
 
         chunk_costs = self._calc_cost_pairs_per_chunk(
@@ -676,6 +715,9 @@ class DistAttnSolver(BaseDistAttnSolver):
         self, remote_rank_entry_per_stage_this_rank: list[RemoteRankEntry]
     ) -> list[list[RemoteRankEntry]]:
         """Initialize remote rank entry per rank for each overlap stage"""
+
+        if self.cp_size == 1:  # cp1 shortcut
+            return []  # empty list
 
         # all gather remote rank entry per stage from each rank
         remote_rank_entry_per_stage_per_rank = [None] * self.cp_size
@@ -860,7 +902,7 @@ class DistAttnSolver(BaseDistAttnSolver):
 
         return remote_rank_entry_per_stage_this_rank
 
-    # TODO delete some logic
+    # TODO delete some unnecessary logic
     @nvtx.instrument_nvtx
     def _calc_remote_rank_entry_for_one_stage(
         self, cost_partiton: list[int], host_rank_entry_this_rank: HostRankEntry
@@ -1194,6 +1236,9 @@ class DistAttnSolver(BaseDistAttnSolver):
 
         transfer_table_per_stage: list[TransferTable] = []
 
+        if self.cp_size == 1:  # cp1 shortcut
+            return transfer_table_per_stage  # empty list
+
         transfer_info_per_stage_this_rank: list[TransferInfo] = [
             self._init_transfer_info_this_rank_for_one_stage(
                 remote_rank_entry_per_rank_this_stage
@@ -1495,25 +1540,26 @@ class DistAttnSolver(BaseDistAttnSolver):
         num_remote_qo_tokens_per_stage: list[int] = [0] * self.overlap_degree
         qo_group_collective_args_list: list[GroupCollectiveArg] = [None] * self.overlap_degree  # type: ignore[list-item]
 
-        for transfer_table_this_stage, remote_rank_entry_per_rank_this_stage in zip(
-            self.transfer_table_per_stage,
-            self.remote_rank_entry_per_rank_per_stage,
-        ):
-            total_seqlen_host_k = remote_rank_entry_per_rank_this_stage[
-                self.cp_rank
-            ].host_k_ranges_global.total_seqlen
+        if self.cp_size > 1:  # cp1 shortcut
+            for transfer_table_this_stage, remote_rank_entry_per_rank_this_stage in zip(
+                self.transfer_table_per_stage,
+                self.remote_rank_entry_per_rank_per_stage,
+            ):
+                total_seqlen_host_k = remote_rank_entry_per_rank_this_stage[
+                    self.cp_rank
+                ].host_k_ranges_global.total_seqlen
 
-            num_remote_kv_tokens = remote_rank_entry_per_rank_this_stage[
-                self.cp_rank
-            ].remote_k_ranges_global.total_seqlen
+                num_remote_kv_tokens = remote_rank_entry_per_rank_this_stage[
+                    self.cp_rank
+                ].remote_k_ranges_global.total_seqlen
 
-            kv_group_collective_arg = self._calc_kv_group_collective_arg(
-                transfer_table_this_stage,
-                total_seqlen_host_k,
-            )
+                kv_group_collective_arg = self._calc_kv_group_collective_arg(
+                    transfer_table_this_stage,
+                    total_seqlen_host_k,
+                )
 
-            num_remote_kv_tokens_per_stage.append(num_remote_kv_tokens)
-            kv_group_collective_args_list.append(kv_group_collective_arg)
+                num_remote_kv_tokens_per_stage.append(num_remote_kv_tokens)
+                kv_group_collective_args_list.append(kv_group_collective_arg)
 
         # build comm meta
         comm_meta = CommMeta(
@@ -1689,6 +1735,7 @@ class DistAttnSolver(BaseDistAttnSolver):
         # ---   build remote attn args for each overlap stage   --- #
 
         remote_attn_args_list = []
+        seqlen_k_per_remote_stage = []
         for (
             remote_rank_entry_this_stage_this_rank
         ) in self.remote_rank_entry_per_stage_this_rank:
@@ -1712,12 +1759,20 @@ class DistAttnSolver(BaseDistAttnSolver):
                     ),
                 )
             )
+            # Get num_remote_kv_tokens for this stage
+            num_remote_kv_tokens = (
+                remote_rank_entry_this_stage_this_rank.remote_k_ranges_global.total_seqlen
+            )
+            seqlen_k_per_remote_stage.append(num_remote_kv_tokens)
 
         # ---   build attn calc meta   --- #
 
         calc_meta = CalcMeta(
             local_attn_arg=local_attn_arg,
             remote_attn_args_list=remote_attn_args_list,
+            seqlen_q_shard=self.shard_seqlen_q,
+            seqlen_k_local=self.total_seqlen_k - sum(seqlen_k_per_remote_stage),
+            seqlen_k_per_remote_stage=seqlen_k_per_remote_stage,
         )
 
         return calc_meta

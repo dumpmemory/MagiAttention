@@ -12,13 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+from torch.nn.attention.flex_attention import create_block_mask
 
 import magi_attention
 from magi_attention.common import AttnRanges
-from magi_attention.utils import format_dict_field, format_list_field
+from magi_attention.utils import (
+    format_dict_field,
+    format_list_field,
+    make_attn_mask_from_ffa_args,
+    nvtx,
+)
+
+is_magi_to_hstu_installed = False
+try:
+    import create_block_mask_cuda
+    import magi_to_hstu_cuda
+
+    is_magi_to_hstu_installed = True
+except ImportError:
+    pass
+
+is_fa4_installed = False
+try:
+    from flash_attn_cute.block_sparsity import (
+        BlockSparseTensorsTorch,
+        LinearBlockSparseTensorsTorch,
+        bhqk_to_linear_sparse_tensors,
+    )
+    from flash_attn_cute.mask_definitions import flex_arbitrary_mask
+
+    is_fa4_installed = True
+except ImportError:
+    pass
+
+try:
+    COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+except Exception:
+    COMPUTE_CAPABILITY = 10
 
 
 @dataclass(repr=False)
@@ -143,9 +176,388 @@ class AttnArg:
 
 
 @dataclass(repr=False)
+class FA4AttnArg(AttnArg):
+    tile_m: int = 128
+    tile_n: int = 128
+    seqlen_q: int = 0
+    seqlen_k: int = 0
+
+    def __post_init__(self):
+        assert is_fa4_installed, "FlashAttn4 is not installed"
+        assert is_magi_to_hstu_installed, "magi_to_hstu_cuda is not installed"
+
+        if COMPUTE_CAPABILITY == 10 and (self.tile_m, self.tile_n) != (128, 128):
+            raise ValueError(
+                "TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM"
+            )
+
+        super().__post_init__()
+
+        # Transfer from FFA args to FA4 args
+        self._transfer_ffa_args_to_fa4_args()
+
+        # Clear FFA args
+        self.ffa_fwd_args_dict.clear()
+        self.ffa_bwd_args_dict.clear()
+
+    def _transfer_ffa_args_to_fa4_args(self) -> None:
+        assert self.skip_attn_fwd == self.skip_attn_bwd
+        if self.skip_attn_fwd:
+            self.fa4_fwd_args_dict = {}
+            self.fa4_bwd_args_dict = {}
+            return
+
+        # Get the uppper bound of maximum number of HSFU functions
+        # derived by the number of attn slices
+        # self.n_ub_func = 2 * len(self.k_ranges) + 1
+        self.n_ub_func = (
+            # TODO: remove this manual set from environment variable
+            magi_attention.functional.fa4_hsfu_max_num_funcs()
+        )
+
+        # Transfer representation of attn mask from AttnSlice to HSTU Functions
+        # where hstu_func: shape=(nfunc, sq), and unsqueeze to (1, 1, nfunc, sq) to be broadcastable
+        with nvtx.add_nvtx_event(
+            f"magi_to_hstu-"
+            f"seqlen_q={self.seqlen_q}-seqlen_k={self.seqlen_k}-"
+            f"n_ub_func={self.n_ub_func}"
+        ):
+            hstu_func = (
+                magi_to_hstu_cuda.magi_to_hstu(
+                    q_ranges=self.ffa_fwd_args_dict["q_ranges"],
+                    k_ranges=self.ffa_fwd_args_dict["k_ranges"],
+                    mask_types=self.ffa_fwd_args_dict["attn_type_map"],
+                    seqlen_q=self.seqlen_q,
+                    seqlen_k=self.seqlen_k,
+                    n_max_func=self.n_ub_func,
+                )
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
+
+            # TODO: compute the real maximum number of HSFU functions in magi_to_hstu
+            self.n_max_func = self.n_ub_func
+
+        # Pad hstu_func to avoid out-of-bounds access in FA4 kernels
+        from magi_attention.api.functools import pad_at_dim
+
+        hstu_func = pad_at_dim(hstu_func, dim=-1, pad_size=self.tile_m * 2, value=0)
+        aux_tensors = [hstu_func]
+
+        # Sanity check: convert hstu mask and attn slice to qxk bitmap mask
+        if magi_attention.is_sanity_check_enable():
+            # Path 1: mask from FFA args directly
+            mask_from_ffa = make_attn_mask_from_ffa_args(
+                q_ranges=self.q_ranges,
+                k_ranges=self.k_ranges,
+                attn_type_map=self.attn_type_map,
+                total_seqlen_q=self.seqlen_q,
+                total_seqlen_k=self.seqlen_k,
+                device=hstu_func.device,
+            )
+
+            # Path 2: mask from hstu_func (before padding)
+            # hstu_func shape: [1, 1, n_max_func, seqlen_q], squeeze to [n_max_func, seqlen_q]
+            hstu_func_squeezed = hstu_func.squeeze(0).squeeze(0)[:, : self.seqlen_q]
+            mask_from_func = self.func_to_mask(hstu_func_squeezed, self.seqlen_k)
+            # Compare the two masks
+            if not torch.equal(mask_from_ffa, mask_from_func):
+                diff_count = (mask_from_ffa != mask_from_func).sum().item()
+                # Find first mismatch position
+                mismatch_indices = (mask_from_ffa != mask_from_func).nonzero(
+                    as_tuple=False
+                )
+                assert len(mismatch_indices) > 0
+                first_mismatch = mismatch_indices[0]
+                q_idx, k_idx = first_mismatch[0].item(), first_mismatch[1].item()
+
+                raise RuntimeError(
+                    f"magi_to_hstu conversion mismatch! {diff_count} positions differ, "
+                    f"where:\n      {self.q_ranges=}\n      {self.k_ranges=}\n      {self.attn_type_map=}\n"
+                    f"      {self.n_ub_func=}, {self.n_max_func=}\n"
+                    f"      with the first mismatch at position: {q_idx=}, {k_idx=}, "
+                    f"ffa={mask_from_ffa[q_idx, k_idx].item()}, "
+                    f"func={mask_from_func[q_idx, k_idx].item()}"
+                )
+
+        # Compute block sparsity for mask_mod
+        if COMPUTE_CAPABILITY == 10:
+            sparse_tile_m = 2 * self.tile_m
+        else:
+            sparse_tile_m = self.tile_m
+
+        # Create linear block sparse masks for both forward and backward
+        if is_magi_to_hstu_installed:
+            with nvtx.add_nvtx_event(
+                f"create_q2k_csr_sparse_from_func-"
+                f"seqlen_q={self.seqlen_q}-seqlen_k={self.seqlen_k}"
+            ):
+                # Q2K (Forward): fix q_block, loop kv_blocks
+                (
+                    cuda_k_mask_cnt,
+                    cuda_k_mask_offset,
+                    cuda_k_mask_idx,
+                    cuda_k_full_cnt,
+                    cuda_k_full_offset,
+                    cuda_k_full_idx,
+                ) = create_block_mask_cuda.create_q2k_csr_sparse_from_func(
+                    hstu_func,
+                    self.seqlen_q,
+                    self.seqlen_k,
+                    Q_BLOCK_SIZE=sparse_tile_m,
+                    KV_BLOCK_SIZE=self.tile_n,
+                    check_q_boundary=False,
+                )
+
+                # Convert to LinearBlockSparseTensorsTorch format
+                # CUDA kernel returns:
+                #   - cnt: [B, H, num_blocks] - directly the counts
+                #   - offset: [B * H * num_blocks + 1] - flattened exclusive prefix sum (starts with 0)
+                #   - idx: [total_blocks] - compact indices
+                linear_k_block_sparse_mask = LinearBlockSparseTensorsTorch(
+                    mask_block_cnt=cuda_k_mask_cnt.flatten(),
+                    mask_block_offset=cuda_k_mask_offset,
+                    mask_block_idx=cuda_k_mask_idx,
+                    full_block_cnt=cuda_k_full_cnt.flatten(),
+                    full_block_offset=cuda_k_full_offset,
+                    full_block_idx=cuda_k_full_idx,
+                )
+            with nvtx.add_nvtx_event(
+                f"create_k2q_csr_sparse_from_func-"
+                f"seqlen_q={self.seqlen_q}-seqlen_k={self.seqlen_k}"
+            ):
+                # K2Q (Backward): fix kv_block, loop q_blocks
+                (
+                    cuda_q_mask_cnt,
+                    cuda_q_mask_offset,
+                    cuda_q_mask_idx,
+                    cuda_q_full_cnt,
+                    cuda_q_full_offset,
+                    cuda_q_full_idx,
+                ) = create_block_mask_cuda.create_k2q_csr_sparse_from_func(
+                    hstu_func,
+                    self.seqlen_q,
+                    self.seqlen_k,
+                    Q_BLOCK_SIZE=self.tile_m,
+                    KV_BLOCK_SIZE=self.tile_n,
+                )
+
+                linear_q_block_sparse_mask = LinearBlockSparseTensorsTorch(
+                    mask_block_cnt=cuda_q_mask_cnt.flatten(),
+                    mask_block_offset=cuda_q_mask_offset,
+                    mask_block_idx=cuda_q_mask_idx,
+                    full_block_cnt=cuda_q_full_cnt.flatten(),
+                    full_block_offset=cuda_q_full_offset,
+                    full_block_idx=cuda_q_full_idx,
+                )
+        else:
+            # Prepare mask_mod
+            def mask_mod_flex(b, h, q_idx, kv_idx, arbitrary_func=hstu_func):
+                return flex_arbitrary_mask(b, h, q_idx, kv_idx, arbitrary_func)
+
+            # Preare linear block sparse mask of k for forward
+            bm = create_block_mask(
+                mask_mod_flex,
+                1,
+                1,
+                self.seqlen_q,
+                self.seqlen_k,
+                device="cuda",
+                BLOCK_SIZE=(sparse_tile_m, self.tile_n),
+            )
+            _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
+            k_block_sparse_mask = BlockSparseTensorsTorch(
+                mask_block_cnt=k_mask_cnt,
+                mask_block_idx=k_mask_idx,
+                full_block_cnt=k_full_cnt,
+                full_block_idx=k_full_idx,
+            )
+            linear_k_block_sparse_mask = bhqk_to_linear_sparse_tensors(
+                k_block_sparse_mask
+            )
+
+            # Preare linear block sparse mask of q for backward
+            bm_bwd = create_block_mask(
+                mask_mod_flex,
+                1,
+                1,
+                self.seqlen_q,
+                self.seqlen_k,
+                device="cuda",
+                BLOCK_SIZE=(self.tile_m, self.tile_n),
+            )
+            (
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                q_mask_cnt,
+                q_mask_idx,
+                q_full_cnt,
+                q_full_idx,
+                *_,
+            ) = bm_bwd.as_tuple()
+            q_block_sparse_mask = BlockSparseTensorsTorch(
+                mask_block_cnt=q_mask_cnt,
+                mask_block_idx=q_mask_idx,
+                full_block_cnt=q_full_cnt,
+                full_block_idx=q_full_idx,
+            )
+            linear_q_block_sparse_mask = bhqk_to_linear_sparse_tensors(
+                q_block_sparse_mask
+            )
+
+        # Prepare FA4 args for both forward and backward
+        self.fa4_fwd_args_dict = dict(
+            linear_k_block_sparse_mask=linear_k_block_sparse_mask,
+            linear_q_block_sparse_mask=linear_q_block_sparse_mask,
+            aux_tensors=aux_tensors,
+        )
+        self.fa4_bwd_args_dict = self.fa4_fwd_args_dict
+
+    def to_fa4_args(self, is_bwd: bool = False) -> dict:
+        return self.fa4_bwd_args_dict if is_bwd else self.fa4_fwd_args_dict
+
+    def to_ffa_args(self, is_bwd: bool = False) -> dict:
+        raise RuntimeError("FA4AttnArg does not support to_ffa_args")
+
+    @classmethod
+    def func_to_mask(cls, func: torch.Tensor, seqlen_k: int) -> torch.Tensor:
+        """
+        Convert func array to 2D attention mask.
+
+        Args:
+            func: shape [n_max_func, seqlen_q], contains interval boundaries
+            seqlen_k: sequence length of K
+
+        Returns:
+            mask: shape [seqlen_q, seqlen_k], True means can attend
+
+        Encoding rule:
+            interval 0: [0, F0)
+            interval 1: [F1, F2)
+            interval 2: [F3, F4)
+            ...
+        """
+        n_max_func, seqlen_q = func.shape
+        device = func.device
+
+        # k indices for broadcasting: [1, seqlen_k]
+        k_indices = torch.arange(seqlen_k, device=device).unsqueeze(0)
+
+        # Initialize mask
+        mask = torch.zeros(seqlen_q, seqlen_k, dtype=torch.bool, device=device)
+
+        # Process first interval: [0, F0)
+        F0 = func[0].unsqueeze(1)  # [seqlen_q, 1]
+        """
+            Assuming seqlen_q = 4, seqlen_k = 8, func[0] = [3, 5, 2, 6]  # F0 value for each q
+            k_indices [1, seqlen_k] broadcasted along rows, F0 [seqlen_q, 1] broadcasted along columns
+            k_indices [1, 8]:  [[0, 1, 2, 3, 4, 5, 6, 7]]
+                            ↓ copied 4 rows
+                    [[0, 1, 2, 3, 4, 5, 6, 7],
+                        [0, 1, 2, 3, 4, 5, 6, 7],
+                        [0, 1, 2, 3, 4, 5, 6, 7],
+                        [0, 1, 2, 3, 4, 5, 6, 7]]
+
+            F0 [4, 1]:         [[3],       → copied 8 columns → [[3, 3, 3, 3, 3, 3, 3, 3],
+                                [5],                     [5, 5, 5, 5, 5, 5, 5, 5],
+                                [2],                     [2, 2, 2, 2, 2, 2, 2, 2],
+                                [6]]                     [6, 6, 6, 6, 6, 6, 6, 6]]
+
+                            k=0  k=1  k=2  k=3  k=4  k=5  k=6  k=7
+                    ┌────┬────┬────┬────┬────┬────┬────┬────┐
+            q0 (F0=3) │ T  │ T  │ T  │ F  │ F  │ F  │ F  │ F  │  → [0,3) visible
+                    ├────┼────┼────┼────┼────┼────┼────┼────┤
+            q1 (F0=5) │ T  │ T  │ T  │ T  │ T  │ F  │ F  │ F  │  → [0,5) visible
+                    ├────┼────┼────┼────┼────┼────┼────┼────┤
+            q2 (F0=2) │ T  │ T  │ F  │ F  │ F  │ F  │ F  │ F  │  → [0,2) visible
+                    ├────┼────┼────┼────┼────┼────┼────┼────┤
+            q3 (F0=6) │ T  │ T  │ T  │ T  │ T  │ T  │ F  │ F  │  → [0,6) visible
+        """
+        mask |= k_indices < F0
+
+        # Process remaining intervals: [F_{2i+1}, F_{2i+2}) for i = 0, 1, ...
+        for i in range((n_max_func - 1) // 2):
+            start_idx = 2 * i + 1
+            end_idx = 2 * i + 2
+            if end_idx >= n_max_func:
+                break
+
+            F_start = func[start_idx].unsqueeze(1)  # [seqlen_q, 1]
+            F_end = func[end_idx].unsqueeze(1)  # [seqlen_q, 1]
+
+            mask |= (k_indices >= F_start) & (k_indices < F_end)
+
+        return mask
+
+    @classmethod
+    def _print_nonzero_by_col(cls, tensor: torch.Tensor, name: str = "tensor") -> None:
+        """
+        Print non-zero elements by column.
+        Assuming tensor shape: [1, 1, nfunc, seq_len] or [nfunc, seq_len]
+        """
+        # Remove leading dimensions, keep only [nfunc, seq_len]
+        t = tensor.squeeze()
+        if t.dim() == 1:
+            t = t.unsqueeze(0)
+
+        nfunc, seq_len = t.shape
+
+        print(f"=== {name} nonzero values (shape: {tensor.shape}) ===", flush=True)
+
+        for col in range(seq_len):
+            col_data = t[:, col]
+            nonzero_mask = col_data != 0
+            if nonzero_mask.any():
+                nonzero_rows = nonzero_mask.nonzero(as_tuple=True)[0]
+                entries = [
+                    f"row {row.item()} = {col_data[row].item()}" for row in nonzero_rows
+                ]
+                print(f"col {col}: {', '.join(entries)}", flush=True)
+
+    def __repr__(self) -> str:
+        indent = ""
+        repr_str = "FA4AttnArg(\n"
+
+        # Base class fields
+        base_repr_lines = super().__repr__().splitlines()
+        for line in base_repr_lines[1:-1]:  # Skip the first and last lines
+            repr_str += f"{indent}    {line}\n"
+
+        # FA4 specific fields
+        repr_str += f"{indent}    tile_m={self.tile_m},\n"
+        repr_str += f"{indent}    tile_n={self.tile_n},\n"
+        repr_str += f"{indent}    seqlen_q={self.seqlen_q},\n"
+        repr_str += f"{indent}    seqlen_k={self.seqlen_k},\n"
+        repr_str += f"{indent}    n_max_func={self.n_ub_func},\n"
+        repr_str += f"{indent}    n_max_func={self.n_max_func},\n"
+
+        repr_str += f"{indent}    # Generated by _transfer_ffa_args_to_fa4_args:\n"
+        repr_str += format_dict_field(
+            "fa4_fwd_args_dict", self.fa4_fwd_args_dict, indent
+        )
+        repr_str += format_dict_field(
+            "fa4_bwd_args_dict", self.fa4_bwd_args_dict, indent
+        )
+
+        repr_str = repr_str.rstrip(",\n") + "\n)"
+        return repr_str
+
+
+@dataclass(repr=False)
 class CalcMeta:
     local_attn_arg: AttnArg
     remote_attn_args_list: list[AttnArg]
+
+    # Specific meta for FA4 backend
+    seqlen_q_shard: int = 0  # local q seqlen from dispatch_meta
+    seqlen_k_local: int = 0  # for local_attn_arg
+    seqlen_k_per_remote_stage: list[int] = field(
+        default_factory=list
+    )  # for remote_attn_args_list
 
     @property
     def overlap_degree(self) -> int:
@@ -155,6 +567,34 @@ class CalcMeta:
         assert (
             self.overlap_degree >= 0
         ), f"Overlap degree must be >= 0, but got {self.overlap_degree=}"
+
+        if (
+            magi_attention.is_fa4_backend_enable()
+            and not magi_attention.is_sdpa_backend_enable()
+        ):
+            assert len(self.seqlen_k_per_remote_stage) == self.overlap_degree, (
+                f"seqlen_k_per_remote_stage length must match overlap_degree, "
+                f"got {len(self.seqlen_k_per_remote_stage)=} vs {self.overlap_degree=}"
+            )
+
+            self.local_attn_arg = FA4AttnArg(
+                q_ranges=self.local_attn_arg.q_ranges,
+                k_ranges=self.local_attn_arg.k_ranges,
+                attn_type_map=self.local_attn_arg.attn_type_map,
+                total_area=self.local_attn_arg.total_area,
+                seqlen_q=self.seqlen_q_shard,
+                seqlen_k=self.seqlen_k_local,
+            )
+            for stage in range(self.overlap_degree):
+                remote_attn_arg = self.remote_attn_args_list[stage]
+                self.remote_attn_args_list[stage] = FA4AttnArg(
+                    q_ranges=remote_attn_arg.q_ranges,
+                    k_ranges=remote_attn_arg.k_ranges,
+                    attn_type_map=remote_attn_arg.attn_type_map,
+                    total_area=remote_attn_arg.total_area,
+                    seqlen_q=self.seqlen_q_shard,
+                    seqlen_k=self.seqlen_k_per_remote_stage[stage],
+                )
 
     def __repr__(self) -> str:
         indent = ""

@@ -24,6 +24,7 @@ from baselines.attn_impl import (
     fa3_varlen_func,
     fa4_func,
     fa4_varlen_func,
+    ffa_fa4_func,
     ffa_func,
     flex_attn_func,
     sdpa_func,
@@ -55,14 +56,9 @@ from magi_attention.common.range import AttnRange
 from magi_attention.common.ranges import AttnRanges
 from magi_attention.utils._utils import make_attn_mask_from_ffa_args
 
-# impls = ["sdpa", "fa2", "fa3", "ffa", "torch"]
-# impls = ["sdpa", "fa2", "fa3", "ffa"]  # ignore torch native to avoid OOM
-# impls = ["fa2", "fa3", "ffa"]  # compare to fa family
-# impls = ["cudnn", "fa3", "ffa"]  # compare to performance top-3 sota
-# impls = ["ffa", "fa3", "cudnn", "fa2", "flex", "sdpa"]  # all except torch native
-# impls = ["ffa", "fa3"]
-# impls = ["ffa", "fa3", "fa4"]
-impls = ["ffa", "cudnn", "fa3", "fa4"]
+# impls = ["ffa", "fa3", "fa4", "cudnn", "fa2", "flex", "sdpa"]  # all except torch native
+# impls = ["cudnn", "fa4", "ffa_fa4"] # for blackwell
+impls = ["ffa", "cudnn", "fa3", "fa4"]  # for hopper
 
 mask_types = ["full"]
 # mask_types = ["causal"]
@@ -71,7 +67,12 @@ mask_types = ["full"]
 # mask_types = ["sliding_window_causal"]
 # mask_types = ["varlen_block_causal"]
 
+# uniform varlen, each doc with fixed seqlen
+# varlen_seqlen_distribution = {
+#     (2048, 2049): 1.0, # 2k seqlen per doc
+# }
 
+# real-world varlen seqlen distribution
 varlen_seqlen_distribution = {
     (0, 2 * 1024): 0.16,
     (2 * 1024, 4 * 1024): 0.05,
@@ -87,14 +88,13 @@ varlen_seqlen_distribution = {
     (2048 * 1024, 4096 * 1024): 0.01,
 }
 
-
-ss = [k * 1024 for k in [1, 2, 4, 8, 16, 24, 32]]
+ss = [k * 1024 for k in [1, 2, 4, 8, 16, 24, 32, 64]]
 ds = [128]
 wds = ["fwd", "bwd"]
 
 
 b = 1
-nhq = 8
+nhq = 48
 nhk = 8
 dtype = torch.bfloat16
 
@@ -381,7 +381,7 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
                 print(f"make varlen causal sdpa mask failed: {e}")
 
     # ffa style shape: (t,h,d)
-    if attn_impl in ("ffa", "cudnn"):
+    if attn_impl in ("ffa", "ffa_fa4", "cudnn"):
         q = q.view(b * sq, nhq, hd)
         k = k.view(b * sk, nhk, hd)
         v = v.view(b * sk, nhk, hd)
@@ -650,6 +650,46 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
                 q_ranges=q_ranges,
                 k_ranges=k_ranges,
                 attn_type_map=attn_type_map,
+            )
+
+        if wd == "bwd":
+            try:
+                o, *rest = fn()
+            except Exception as e:
+                if "CUDA out of memory" not in str(e):
+                    print(
+                        f"Error occured before running {attn_impl} with {mask_type} mask "
+                        f"when {seqlen=}, {hd=} during {wd}: {e=}"
+                    )
+                    raise e
+                already_known_oom_before_run = True
+
+            def fn():
+                o.backward(do, retain_graph=True)
+
+    elif attn_impl == "ffa_fa4":
+        # Warmup call to create cached FA4AttnArg (reuse_attn_arg=False)
+        _ = ffa_fa4_func(
+            q,
+            k,
+            v,
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_type_map=attn_type_map,
+            reuse_attn_arg=False,
+        )
+        torch.cuda.synchronize()  # Wait for warmup kernel to complete
+
+        def fn():
+            # Use cached FA4AttnArg for accurate kernel timing
+            return ffa_fa4_func(
+                q,
+                k,
+                v,
+                q_ranges=q_ranges,
+                k_ranges=k_ranges,
+                attn_type_map=attn_type_map,
+                reuse_attn_arg=True,
             )
 
         if wd == "bwd":

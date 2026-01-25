@@ -70,36 +70,14 @@ from magi_attention.utils import (
 )
 
 
+# TODO: rewrite the specific function for unitest profiling mode
 class TestPipelineBaseWithWorldSize1(DistTestBase):
     def init_pg(self) -> None:
         super().init_pg()
 
-        self.flag_to_envvar = {
-            "device_max_connections": "CUDA_DEVICE_MAX_CONNECTIONS",
-            "deterministic_mode": "MAGI_ATTENTION_DETERMINISTIC_MODE",
-            "enable_hier_comm": "MAGI_ATTENTION_HIERARCHICAL_COMM",
-            "enable_qo_comm": "MAGI_ATTENTION_QO_COMM",
-            "enable_native_grpcoll": "MAGI_ATTENTION_NATIVE_GRPCOLL",
-            "fwd_hp_reduce": "MAGI_ATTENTION_FORWARD_HIGH_PRECISION_REDUCE",
-            "bwd_hp_reduce": "MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE",
-        }
-
-        # init flag generator and its iterator
-        self.flag_generator = FlagCombGenerator(
-            flags=list(self.flag_to_envvar.keys()),
-            options={
-                "device_max_connections": [1, 8],
-            },
-            defaults={
-                "device_max_connections": 8,
-            },
-            groups=[
-                # group for comm
-                ("enable_hier_comm", "enable_qo_comm", "enable_native_grpcoll"),
-            ],
-            strategy="heuristic",
-        )
-        self.flag_iterator = iter(self.flag_generator)
+        assert (
+            not magi_attention.is_sdpa_backend_enable()
+        ), "SDPA backend is not supported in this test suite."
 
         # init several pgs with all ranks
         self.nccl_groups = [
@@ -141,14 +119,82 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
 
         # -----    set up for native grpcoll   ---- #
 
+        native_grpcoll_registered = True
         for nccl_group in self.nccl_groups:
-            grpcoll_buffer_mgr.initialize(
-                group=nccl_group,
-                config=GrpCollConfig(
-                    num_sms=24,
-                    num_nvl_bytes=int(2e9) * self.world_size // 8,  # ~2GB for 8 ranks
+            try:
+                grpcoll_buffer_mgr.initialize(
+                    group=nccl_group,
+                    config=GrpCollConfig(
+                        num_sms=24,
+                        num_nvl_bytes=int(2e9)
+                        * self.world_size
+                        // 8,  # ~2GB for 8 ranks
+                    ),
+                )
+            except Exception as e:
+                native_grpcoll_registered = False
+                print(
+                    f"The NCCL group {nccl_group} cannot be registered due to error: \n{e}\n"
+                )
+
+        # -----    set up for flags   ---- #
+
+        self.flag_to_envvar = {
+            "device_max_connections": "CUDA_DEVICE_MAX_CONNECTIONS",
+            "deterministic_mode": "MAGI_ATTENTION_DETERMINISTIC_MODE",
+            "enable_hier_comm": "MAGI_ATTENTION_HIERARCHICAL_COMM",
+            "enable_qo_comm": "MAGI_ATTENTION_QO_COMM",
+            "enable_native_grpcoll": "MAGI_ATTENTION_NATIVE_GRPCOLL",
+            "fwd_hp_reduce": "MAGI_ATTENTION_FORWARD_HIGH_PRECISION_REDUCE",
+            "bwd_hp_reduce": "MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE",
+        }
+
+        # init flag generator and its iterator
+        self.flag_generator = FlagCombGenerator(
+            flags=list(self.flag_to_envvar.keys()),
+            options={
+                "device_max_connections": [1, 8],
+                "enable_native_grpcoll": (
+                    [False, True]
+                    if native_grpcoll_registered
+                    # disable native grpcoll if not registered successfully
+                    else [False]
                 ),
-            )
+                "deterministic_mode": (
+                    [False, True]
+                    if not magi_attention.is_fa4_backend_enable()
+                    # TODO: support deterministic mode for fa4 backend
+                    else [False]
+                ),
+                "fwd_hp_reduce": (
+                    [False, True]
+                    if not magi_attention.is_fa4_backend_enable()
+                    # TODO: support forward high precision reduce for fa4 backend
+                    else [False]
+                ),
+                "bwd_hp_reduce": (
+                    [False, True]
+                    if not magi_attention.is_fa4_backend_enable()
+                    # TODO: support backward high precision reduce for fa4 backend
+                    else [False]
+                ),
+                "enable_qo_comm": (
+                    [False, True]
+                    if not magi_attention.is_fa4_backend_enable()
+                    # TODO: support qo comm for fa4 backend
+                    else [False]
+                ),
+            },
+            defaults={
+                "device_max_connections": 8,
+            },
+            groups=[
+                # group for comm
+                ("enable_hier_comm", "enable_qo_comm", "enable_native_grpcoll"),
+            ],
+            strategy="heuristic",
+        )
+        self.flag_iterator = iter(self.flag_generator)
 
     @property
     def timeout(self) -> int:
@@ -375,7 +421,7 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
             {
                 PROFILE_ONLY: True,
                 NAME: "full_attn_144k",
-                SKIP_WORLD_SIZE: [1, 2, 3, 5, 6, 7, 8],
+                SKIP_WORLD_SIZE: [],
                 "q_ranges": AttnRanges.from_ranges(
                     [
                         [0, 147456],
@@ -396,7 +442,7 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
             {
                 PROFILE_ONLY: True,
                 NAME: "varlen_block_causal_144k",
-                SKIP_WORLD_SIZE: [1, 2, 3, 5, 6, 7, 8],
+                SKIP_WORLD_SIZE: [],
                 "q_ranges": AttnRanges.from_ranges(
                     [
                         [0, 20480],
@@ -656,7 +702,12 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
 
         total_seqlen_q: int = attn_config["total_seqlen_q"]
         total_seqlen_k: int = attn_config["total_seqlen_k"]
-        total_seqlen_sink: int = attn_config.get("total_seqlen_sink", 0)
+        total_seqlen_sink: int = (
+            # TODO: support attn sink for fa4 backend
+            0
+            if magi_attention.is_fa4_backend_enable()
+            else attn_config.get("total_seqlen_sink", 0)
+        )
         chunk_size: int = attn_config["chunk_size"]
         num_heads_q, num_heads_kv = num_heads
         softmax_scale = (  # choose softmax_scale by rule
@@ -892,6 +943,9 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
                         "dsink_norm_rtol_ratio": NORM_RTOL_RATIO * 2,
                         "dsink_atol": 2e-4 if sink_layout == "sh" else EPSILON,
                         "dsink_rtol": 0.15,
+                        "lse_min_norm_rtol": 2e-5
+                        if magi_attention.is_fa4_backend_enable()
+                        else 0.0,
                     },
                 )
 
