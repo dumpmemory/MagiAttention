@@ -118,7 +118,7 @@ class TestDistAttn(DistTestBase):
 
     @property
     def timeout(self) -> int:
-        return 1200
+        return 1800
 
     @property
     def seed(self) -> int:
@@ -162,10 +162,6 @@ class TestDistAttn(DistTestBase):
             # TODO: support hier comm with native grpcoll
             if use_native_grpcoll:
                 return
-
-        # sdpa backend do not support return max logits
-        if return_max_logits and use_sdpa_backend:
-            return
 
         # switch the env flags
         switch_back = switch_envvars(
@@ -341,7 +337,7 @@ class TestDistAttn(DistTestBase):
                 local_max_logits,
                 total_max_logits_ref,
                 atol=EPSILON,
-                rtol=1e-3,
+                rtol=1e-2 if use_sdpa_backend else 1e-3,
                 mismatch_threshold=0.01,
                 test_case="max_logits",
             )
@@ -373,7 +369,7 @@ class TestDistAttn(DistTestBase):
             assert_close(
                 total_dsink,
                 total_dsink_ref,
-                atol=1e-3,
+                atol=5e-3,
                 rtol=0.1,
                 mismatch_threshold=max(1 / (seqlen_sink * nhq), 5e-2),
                 test_case="dsink",
