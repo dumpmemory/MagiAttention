@@ -621,7 +621,7 @@ def prebuild_ffa_kernels() -> None:
             sparse_load=False,
             swap_bwd_qk_loop=False,
             profile_mode=False,
-            return_max_logit=False,
+            return_max_logits=False,
         )
         spec.build()
         src_dir = (jit_env.MAGI_ATTENTION_JIT_DIR / uri).resolve()
@@ -638,7 +638,7 @@ def prebuild_ffa_kernels() -> None:
                 uri = fut.result()
                 print(f"Prebuilt: {uri}")
             except Exception as e:
-                print(f"Prebuild failed for {c}: {e}")
+                raise RuntimeError(f"Prebuild failed for {c}: {e}") from e
 
 
 # build ext modules
