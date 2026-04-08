@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
-import magi_attention
+from magi_attention import env
 from magi_attention.comm.primitive.grpcoll._group_collective_hier import (
     init_hier_group_cast_meta_solver,
     init_hier_group_reduce_meta_solver,
@@ -186,12 +186,15 @@ class A2AVBasedGroupCollectiveArg(GroupCollectiveArg):
         super().__post_init__()
 
         assert (
-            not magi_attention.comm.is_native_grpcoll_enable()
+            not env.comm.is_native_grpcoll_enable()
         ), "This arg dataclass is not supported for native grpcoll."
 
         self.device = torch.cuda.current_device()
 
-        # NOTE: only sum-reduce has non-deterministic kernel by now
+        # DEVIATION: deterministic may be forced True when reduce_op != "sum"
+        # Reason: only sum-reduce has a non-deterministic kernel; all other
+        #   reduce ops are inherently deterministic, so the flag is upgraded.
+        # Recovery: none — forcing True is strictly safer for the user.
         self.deterministic |= self.reduce_op != "sum"
 
         # ----   packed group cast args dict  ---- #
@@ -214,7 +217,7 @@ class A2AVBasedGroupCollectiveArg(GroupCollectiveArg):
 
         # ----   additional kwargs  ---- #
 
-        if magi_attention.comm.is_hierarchical_comm_enable():
+        if env.comm.is_hierarchical_comm_enable():
             assert self.device_mesh.ndim == 2, (  # type: ignore[union-attr]
                 f"The hierarchical comm is only supported for 2D device mesh, "
                 f"but got {self.device_mesh.ndim=}."  # type: ignore[union-attr]
@@ -378,7 +381,7 @@ class A2AVBasedGroupCollectiveArg(GroupCollectiveArg):
                 indent,
             )
 
-        if magi_attention.comm.is_hierarchical_comm_enable():
+        if env.comm.is_hierarchical_comm_enable():
             repr_str += f"{indent}    intra_group={repr(self.intra_group)},\n"
             repr_str += f"{indent}    inter_group={repr(self.inter_group)},\n"
 
@@ -395,10 +398,10 @@ class NativeGroupCollectiveArg(GroupCollectiveArg):
         super().__post_init__()
 
         assert (
-            magi_attention.comm.is_native_grpcoll_enable()
+            env.comm.is_native_grpcoll_enable()
         ), "This arg dataclass is only supported for native grpcoll."
         assert (
-            not magi_attention.comm.is_hierarchical_comm_enable()
+            not env.comm.is_hierarchical_comm_enable()
         ), "This arg dataclass is not supported for hierarchical comm for now."
 
         self._check_split_alignment()
@@ -500,6 +503,10 @@ class NativeGroupCollectiveArg(GroupCollectiveArg):
         ] = self._group_cast_args_dict["native_grpcoll_handle_dict"]
 
     def _preprocess_args_for_split_alignment(self):
+        # DEVIATION: split sizes in internal dicts are divided by split_alignment
+        # Reason: the native grpcoll kernel operates on alignment-scaled units,
+        #   so user-facing token-granularity split sizes must be converted.
+        # Recovery: multiply by self.split_alignment to recover original sizes.
         if self.split_alignment > 1:
             self._group_cast_args_dict["input_split_sizes"] = [
                 split // self.split_alignment
@@ -608,7 +615,7 @@ class CommMeta:
         )
         self._num_heads_per_group = self.num_heads_q // self.num_heads_kv
 
-        if magi_attention.comm.is_native_grpcoll_enable():
+        if env.comm.is_native_grpcoll_enable():
             self._init_native_grpcoll_args()
         else:
             self._init_a2av_based_grpcoll_args()
@@ -644,8 +651,11 @@ class CommMeta:
             num_remote_kv_tokens = self.num_remote_kv_tokens_per_stage[stage]
             kv_group_collective_kwargs = vars(self.kv_group_collective_args_list[stage])
 
-            # --- for fetch packed kv and reduce packed dkv  --- #
-
+            # DEVIATION: num_remote_kv_tokens_per_stage[stage] multiplied by 2 in-place,
+            #   kv_group_collective_args_list[stage] replaced with A2AVBasedGroupCollectiveArg
+            # Reason: KV and dKV are packed along the seqlen dim for fused fetch/reduce,
+            #   so the token count must double and the collective arg must carry packed_times=2.
+            # Recovery: original token count is num_remote_kv_tokens_per_stage[stage] // 2.
             self.num_remote_kv_tokens_per_stage[stage] = num_remote_kv_tokens * 2
             self.kv_group_collective_args_list[stage] = A2AVBasedGroupCollectiveArg(
                 **kv_group_collective_kwargs,
@@ -654,7 +664,7 @@ class CommMeta:
                 init_group_reduce=True,
             )
 
-            if magi_attention.comm.is_qo_comm_enable():
+            if env.comm.is_qo_comm_enable():
                 num_remote_qo_tokens = self.num_remote_qo_tokens_per_stage[stage]
                 qo_group_collective_kwargs = vars(
                     self.qo_group_collective_args_list[stage]
@@ -715,7 +725,7 @@ class CommMeta:
                 **kv_group_collective_kwargs,
             )
 
-            if magi_attention.comm.is_qo_comm_enable():
+            if env.comm.is_qo_comm_enable():
                 # --- for fetch q, reduce dq, fetch tupled q,o,do,lse and reduce out with lse  --- #
 
                 qo_group_collective_kwargs = vars(
@@ -753,7 +763,7 @@ class CommMeta:
         # Generated fields from __post_init__
         repr_str += f"{indent}    # Generated by __post_init__:\n"
         repr_str += f"{indent}    num_heads_per_group={self.num_heads_per_group},\n"
-        if not magi_attention.comm.is_native_grpcoll_enable():
+        if not env.comm.is_native_grpcoll_enable():
             # num_remote_qo_do_tokens_per_stage
             repr_str += f"{indent}    num_remote_qo_do_tokens_per_stage={self.num_remote_qo_do_tokens_per_stage},\n"
             # qo_do_group_collective_args_list

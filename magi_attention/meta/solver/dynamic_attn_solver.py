@@ -18,6 +18,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
 import magi_attention
+from magi_attention import env
 from magi_attention.common import (
     AttnRange,
     AttnRanges,
@@ -68,7 +69,7 @@ class DynamicAttnSolver(BaseDistAttnSolver):
         self.algorithm = algorithm
         self.cp_group = cp_group
         self.cp_mesh = cp_mesh
-        self.deterministic = magi_attention.is_deterministic_mode_enable()
+        self.deterministic = env.general.is_deterministic_mode_enable()
         self.calc_local_range = calc_local_range
 
         # Prefer values from dispatch meta if provided
@@ -136,7 +137,7 @@ class DynamicAttnSolver(BaseDistAttnSolver):
         k_ranges: AttnRanges,
         attn_mask_type: Union[list[int], list[AttnMaskType], AttnMaskType],
     ):
-        flatten_head_groups = magi_attention.is_flatten_head_groups_enable()
+        flatten_head_groups = env.general.is_flatten_head_groups_enable()
         if flatten_head_groups:
             self.num_heads_group = self.num_heads_kv
             self.num_heads_q = self.num_heads_q // self.num_heads_group
@@ -160,7 +161,10 @@ class DynamicAttnSolver(BaseDistAttnSolver):
             self.host_q_ranges_global = self.host_ranges_q[self.cp_rank]
             self.host_k_ranges_global = self.host_ranges_k[self.cp_rank]
 
-        # normalize attn_mask_type to list[AttnMaskType]
+        # DEVIATION: scalar attn_mask_type is broadcast to list[AttnMaskType]
+        # Reason: internal solver operates per-range; a single mask type is a
+        #   user-convenience shorthand meaning "same mask for every range".
+        # Recovery: lossless — list elements are identical to the scalar input.
         if isinstance(attn_mask_type, AttnMaskType):
             attn_mask_type_list: list[int] | list[AttnMaskType] = [
                 attn_mask_type

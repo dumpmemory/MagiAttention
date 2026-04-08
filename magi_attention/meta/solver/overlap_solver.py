@@ -14,7 +14,7 @@
 
 import random
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import torch.nn as nn
@@ -70,9 +70,18 @@ class GreedyOverlapAlg(OverlapAlg):
 
 @dataclass(frozen=True)
 class OverlapConfig:
-    """The config dataclass for multi-stage overlapping"""
+    """The config dataclass for multi-stage overlapping.
 
-    enable: bool = True  # if False, turn off the multi-stage overlapping mode
+    The ``degree`` parameter controls both the overlap behavior and the number
+    of remote pipeline stages:
+
+    - ``degree=0``: **no overlap** -- blocking communication + merged attn_arg,
+      completely avoids LSE reduce precision loss.
+    - ``degree=1``: local + 1 remote stage, no multi-stage chunking.
+    - ``degree=N (N>=2)``: local + N remote stages (static multi-stage overlap).
+    - ``degree=None``: dynamic mode -- the overlap solver automatically
+      determines the optimal degree at runtime.
+    """
 
     mode: AttnOverlapMode = AttnOverlapMode.STATIC
 
@@ -94,12 +103,30 @@ class OverlapConfig:
         1.0  # define: comm_cost = comm_cost_factor * comm_size (unit: μs)
     )
 
+    _no_overlap: bool = field(init=False, repr=False, compare=False, default=False)
+
+    @property
+    def no_overlap(self) -> bool:
+        """Whether to use no-overlap mode (blocking comm + merged attn_arg)."""
+        return self._no_overlap
+
+    @property
+    def enable(self) -> bool:
+        """Whether multi-stage overlap is enabled (degree >= 2 or dynamic)."""
+        return not self._no_overlap and (self.degree is None or self.degree >= 2)
+
     def __post_init__(self):
-        if not self.enable:
-            # HACK: force auto-set other attrs to disable mso
+        # DEVIATION: degree=0 is normalized to degree=1, max_num_chunks forced to 1
+        # Reason: degree=0 is a user-facing shorthand for "no overlap" (blocking
+        #   comm + merged attn_arg), but pipeline scheduling requires degree>=1.
+        # Recovery: self._no_overlap / self.no_overlap preserves the original intent.
+        object.__setattr__(self, "_no_overlap", self.degree == 0)
+
+        if self.degree is not None and self.degree <= 1:
             object.__setattr__(self, "mode", AttnOverlapMode.STATIC)
-            object.__setattr__(self, "degree", 1)
-            object.__setattr__(self, "max_num_chunks", 1)
+            if self._no_overlap:
+                object.__setattr__(self, "degree", 1)
+                object.__setattr__(self, "max_num_chunks", 1)
 
         if self.mode is AttnOverlapMode.STATIC:
             assert self.degree is not None, (
@@ -243,7 +270,7 @@ class OverlapSolver(nn.Module):
         **kwargs,
     ) -> None:
         """Uniformly partition the stage costs into `overlap_degree` merged stages
-        which only serves as as a dummy but feasible solution
+        which only serves as a dummy but feasible solution
         for verification of correctness, instead of production.
 
         Args:
