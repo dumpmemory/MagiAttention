@@ -54,9 +54,11 @@ template <
     int QheadPerKhead,
     bool SwapAB,
     bool SparseLoad,
+    bool IndexAttn,
     bool ReturnMaxLogits,
     bool ProfileMode = false>
 void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
+  static_assert(!(SparseLoad && IndexAttn), "SparseLoad and IndexAttn cannot be enabled at the same time");
   using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
   // Get tile size and kernel configuration for SM90
   // if SwapAB, mma V @ P is SS mode
@@ -87,7 +89,8 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       PackGQA,
       QheadPerKhead,
       SwapAB,
-      SparseLoad>;
+      SparseLoad,
+      IndexAttn>;
 
   using Scheduler = flash::DynamicPersistentTileSchedulerFwd<
       kBlockM,
@@ -95,7 +98,8 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       CollectiveMainloop::NumProducerThreads,
       /*WarpSpecialized=*/Arch >= 90,
       PackGQA,
-      Deterministic>;
+      Deterministic,
+      IndexAttn>;
 
   using CollectiveEpilogue = flash::CollectiveEpilogueFwd<
       TileShape_MNK_PV,
@@ -133,8 +137,9 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
         params.qk_map,
         params.sparse_load_loop_count, // loop count for each unique Q range when sparse load
         params.sparse_load_invalid_count, // invalid token count for each unique Q range when sparse load
-        params.equal_k_range_size // whether all K ranges are of equal size
-    };
+        params.equal_k_range_size, // whether all K ranges are of equal size
+        params.index_attn_indices, // [num_unique_q, max_topk] int32 global KV row ids
+        params.index_attn_max_topk};
   }();
 
   typename CollectiveEpilogue::Arguments epilogue_args{
@@ -215,6 +220,7 @@ template <
     bool RangeMerge,
     bool SwapAB,
     bool kSparseLoad,
+    bool kIndexAttn,
     bool kReturnMaxLogits,
     bool kProfileMode>
 void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
@@ -243,6 +249,7 @@ void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
         /*QheadPerKhead=*/QheadPerKhead,
         /*SwapAB=*/SwapAB,
         /*SparseLoad=*/kSparseLoad,
+        /*IndexAttn=*/kIndexAttn,
         /*ReturnMaxLogits=*/kReturnMaxLogits,
         /*ProfileMode=*/kProfileMode>(params, stream);
   });

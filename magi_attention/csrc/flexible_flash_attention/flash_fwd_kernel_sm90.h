@@ -58,6 +58,7 @@ class FlashAttnFwdSm90 {
   static constexpr bool PackGQA = CollectiveMainloop::PackGQA;
   static constexpr bool SwapAB = CollectiveMainloop::SwapAB;
   static constexpr bool SparseLoad = CollectiveMainloop::SparseLoad;
+  static constexpr bool IndexAttn = CollectiveMainloop::IndexAttn;
   static constexpr bool ReturnMaxLogits = CollectiveEpilogue::ReturnMaxLogits;
   static constexpr int NumMaxLogits = CollectiveEpilogue::NumMaxLogits;
 
@@ -92,8 +93,10 @@ class FlashAttnFwdSm90 {
 
   // Register requirement for Load and Math WGs
   // If we use cp.async to load K and V, we need more registers for the producer WG.
-  static constexpr uint32_t LoadRegisterRequirement = SparseLoad ? 64 : (NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 40 : 40) : 32));
-  static constexpr uint32_t MmaRegisterRequirement = SparseLoad ? 216 : (NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 232 : 232) : 160));
+  static constexpr uint32_t LoadRegisterRequirement =
+      (SparseLoad || IndexAttn) ? 64 : (NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 40 : 40) : 32));
+  static constexpr uint32_t MmaRegisterRequirement =
+      (SparseLoad || IndexAttn) ? 216 : (NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 232 : 232) : 160));
 
   // If you want to print from the producer warp, you'd need to increase the
   // number of registers Otherwise you'll get CUDA error.
@@ -270,8 +273,8 @@ class FlashAttnFwdSm90 {
     TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
     if (warp_group_idx == 0) { // Producer
-      if constexpr (!SparseLoad) {
-        // normal load using TMA
+      if constexpr (!SparseLoad && !IndexAttn) {
+        // Dense path: normal load using TMA
         using BlockMetaT = typename CollectiveMainloop::BlockMeta</*IsProducer=*/true>;
 
         // Deallocate the registers for the producer WG,
@@ -333,7 +336,8 @@ class FlashAttnFwdSm90 {
           }
         }
         mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v, shared_storage, work_idx);
-      } else {
+      } else if constexpr (SparseLoad) {
+        // SparseLoad path: uses cp.async cooperative loading
         using BlockMetaT = typename CollectiveMainloop::SparseLoadBlockMeta;
 
         // Deallocate the registers for the producer WG, this makes the consumer
@@ -374,9 +378,56 @@ class FlashAttnFwdSm90 {
           }
         }
         mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v, shared_storage, work_idx);
+      } else if constexpr (IndexAttn) {
+        // IndexAttn path: uses if constexpr(IndexAttn) inside load/mma
+        using BlockMetaT = typename CollectiveMainloop::template IndexAttnBlockMeta</*IsProducer=*/true>;
+        int thread_idx = threadIdx.x % NumProducerThreads;
+
+        cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+
+        PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipelineK>();
+        PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipelineV>();
+
+        int work_idx = 0;
+        int warp_idx_in_warpgroup = canonical_warp_idx_in_warpgroup_sync();
+        static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
+
+        if constexpr (SingleProducerWarp) {
+          if (warp_idx_in_warpgroup != 0) {
+            return;
+          }
+        }
+
+        for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler)
+                                                                                    : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+             work_tile_info.is_valid(params.scheduler);
+             work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0
+                 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
+                 : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
+          BlockCoordType block_coord_raw = work_tile_info.get_block_coord(params.scheduler);
+          auto block_coord = cute::make_tuple(get<0>(block_coord_raw), get<1>(block_coord_raw), get<2>(block_coord_raw));
+          BlockMetaT block_meta = BlockMetaT{params.mainloop, block_coord, shared_storage, thread_idx};
+
+          auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() { scheduler.prefetch_next_work(params.scheduler, work_tile_info); };
+
+          bool has_tile_valid =
+              mainloop.load(params.mainloop, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v, shared_storage, scheduler_prefetch, block_meta, work_idx);
+
+          scheduler_prefetch();
+          if (has_tile_valid) {
+            ++work_idx;
+          }
+        }
+        mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v, shared_storage, work_idx);
       }
     } else { // Consumer
-      using BlockMetaT = std::conditional_t<!SparseLoad, typename CollectiveMainloop::BlockMeta</*IsProducer=*/false>, typename CollectiveMainloop::SparseMmaBlockMeta>;
+      using BlockMetaT = std::conditional_t<
+          SparseLoad,
+          typename CollectiveMainloop::SparseMmaBlockMeta,
+          std::conditional_t<
+              IndexAttn,
+              typename CollectiveMainloop::template IndexAttnBlockMeta</*IsProducer=*/false>,
+              typename CollectiveMainloop::BlockMeta</*IsProducer=*/false>>>;
 
       // Allocate the registers for the consumer WGs
       cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
@@ -462,6 +513,7 @@ class FlashAttnFwdSm90 {
         // Run the epilogue to store reduced scaled O
         // NOTE: do this here before the epilogue so that the next tile is ready to go.
         work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
+
         if (has_tile_valid) {
           block_coord = [&]() {
             if constexpr (RangeMerge) {

@@ -57,7 +57,9 @@ void set_params_fprop(
     bool const has_max_seqlen_q,
     int const blocks_per_batch,
     int const tiles_per_batch_per_intergroup,
-    int const max_tile_idx) {
+    int const max_tile_idx,
+    void* index_attn_indices_d,
+    int const index_attn_max_topk) {
   // Reset the parameters
   params = {};
 
@@ -144,6 +146,10 @@ void set_params_fprop(
   params.blocks_per_batch = blocks_per_batch;
   params.tiles_per_batch_per_intergroup = tiles_per_batch_per_intergroup;
   params.max_tile_idx = max_tile_idx;
+
+  // Set IndexAttn indices direct path params
+  params.index_attn_indices = static_cast<int*>(index_attn_indices_d);
+  params.index_attn_max_topk = index_attn_max_topk;
 }
 
 void set_params_dgrad(

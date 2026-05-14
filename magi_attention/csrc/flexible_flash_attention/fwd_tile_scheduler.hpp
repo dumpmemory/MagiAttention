@@ -59,7 +59,8 @@ template <
     int NumProducerThreads = cutlass::NumThreadsPerWarp,
     bool WarpSpecialized = true,
     bool PackGQA = false,
-    bool Deterministic = false>
+    bool Deterministic = false,
+    bool IndexAttn = false>
 class DynamicPersistentTileSchedulerFwd {
   static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
   static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
@@ -96,6 +97,16 @@ class DynamicPersistentTileSchedulerFwd {
     int tiles_per_batch_per_intergroup = 0; // Optional: precomputed tiles per batch per intergroup when has_max_seqlen_q
     int max_tile_idx = 0; // Optional: maximum valid tile index when has_max_seqlen_q
   };
+
+  // For IndexAttn, each "batch" is a single q token so range = {bidb, bidb+1}.
+  // For dense/SparseLoad, read the actual range from gmem.
+  CUTLASS_DEVICE static int2 get_batch_range(Params const& params, int bidb) {
+    if constexpr (!IndexAttn) {
+      return params.ranges[bidb];
+    } else {
+      return make_int2(bidb, bidb + 1);
+    }
+  }
 
   static Params to_underlying_arguments(TileSchedulerArguments const& args) {
     // for packgqa, the seqlen_scale_factor is the number of heads per kv group, otherwise it is 1.
@@ -177,7 +188,7 @@ class DynamicPersistentTileSchedulerFwd {
       int m_blocks_this_batch = 0;
 
       if (batch_idx < actual_num_batches) {
-        int2 range = params.ranges[batch_idx];
+        int2 range = get_batch_range(params, batch_idx);
         int seqlen = range.y - range.x;
         if (seqlen > 0) {
           m_blocks_this_batch = cute::ceil_div(seqlen * params.seqlen_scale_factor, kBlock);
@@ -246,7 +257,7 @@ class DynamicPersistentTileSchedulerFwd {
 
         // update missed batch's conflict state, loop for bidb_last ~ bidb_now
         while (bidb_last < bidb_now) {
-          int2 bidb_last_lr = params.ranges[bidb_last];
+          int2 bidb_last_lr = get_batch_range(params, bidb_last);
           int bidb_last_l_physical = bidb_last_lr.x * seqlen_scale_factor;
           int bidb_last_r_physical = bidb_last_lr.y * seqlen_scale_factor;
 
@@ -274,7 +285,7 @@ class DynamicPersistentTileSchedulerFwd {
         //     so that the arrive time can equal range_lock A
         //     batch block 5~15 should arrive left range_lock 0~10 twice, but right range_lock 10~20 once (l_arrive_twice == true)
         //     batch block 15~20 should arrive left range_lock 10~20 once, but right range_lock 20~30 twice (r_arrive_twice == true)
-        int2 lr = params.ranges[bidb_now];
+        int2 lr = get_batch_range(params, bidb_now);
         int l_physical = lr.x * seqlen_scale_factor;
         int r_physical = lr.y * seqlen_scale_factor;
 
@@ -334,7 +345,7 @@ class DynamicPersistentTileSchedulerFwd {
         }
 
         // compute the actual block needed for this bidb.
-        int2 range = params.ranges[bidb];
+        int2 range = get_batch_range(params, bidb);
         int seqlen = range.y - range.x;
         int actual_blocks = seqlen > 0 ? cute::ceil_div(seqlen * params.seqlen_scale_factor, kBlock) : 0;
 
@@ -372,7 +383,7 @@ class DynamicPersistentTileSchedulerFwd {
     // Helper function to calculate how many blocks are needed to compute the current batch
     auto get_num_m_blocks = [&](int bidb_start) {
       int batch_idx = lane + bidb_start;
-      int2 range = params.ranges[batch_idx];
+      int2 range = get_batch_range(params, batch_idx);
       int seqlen = batch_idx < actual_num_batches ? range.y - range.x : 0;
       return batch_idx < actual_num_batches && lane < cutlass::NumThreadsPerWarp - 1 ? cute::ceil_div(seqlen * params.seqlen_scale_factor, kBlock) : 0;
     };
