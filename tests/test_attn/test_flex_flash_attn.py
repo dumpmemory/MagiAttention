@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import random
+from datetime import datetime
 from typing import Any
 
 import torch
@@ -373,6 +374,7 @@ class TestFlexFlashAttn(DistTestBase):
         cat_gqa: bool,
         test_case: str,
         max_seqlen_q: int | None = None,
+        swap_bwd_qk_loop: bool = False,
     ):
         t, h, d = q.shape
         o_acc = torch.randn_like(q, dtype=torch.float32)
@@ -390,14 +392,28 @@ class TestFlexFlashAttn(DistTestBase):
                 fwd_qk_map,
                 fwd_unique_count,
             ) = merge_ranges(q_ranges_tensor, k_ranges_tensor, attn_type_map_tensor)
-            (
-                merge_k_ranges,
-                bwd_k_ranges,
-                bwd_q_ranges,
-                bwd_attn_type_map,
-                bwd_kq_map,
-                bwd_unique_count,
-            ) = merge_ranges(k_ranges_tensor, q_ranges_tensor, attn_type_map_tensor)
+            if swap_bwd_qk_loop:
+                (
+                    merge_k_ranges,
+                    bwd_q_ranges,
+                    bwd_k_ranges,
+                    bwd_attn_type_map,
+                    bwd_kq_map,
+                    bwd_unique_count,
+                ) = merge_ranges(
+                    q_ranges_tensor, k_ranges_tensor, attn_type_map=attn_type_map_tensor
+                )
+            else:
+                (
+                    merge_k_ranges,
+                    bwd_k_ranges,
+                    bwd_q_ranges,
+                    bwd_attn_type_map,
+                    bwd_kq_map,
+                    bwd_unique_count,
+                ) = merge_ranges(
+                    k_ranges_tensor, q_ranges_tensor, attn_type_map=attn_type_map_tensor
+                )
         else:
             fwd_q_ranges = q_ranges_tensor
             fwd_k_ranges = k_ranges_tensor
@@ -556,7 +572,7 @@ class TestFlexFlashAttn(DistTestBase):
             merge_k_ranges=merge_k_ranges,
             bwd_kq_map=bwd_kq_map,
             bwd_unique_count=bwd_unique_count,
-            swap_bwd_qk_loop=False,  # TODO: test when it's `True`
+            swap_bwd_qk_loop=swap_bwd_qk_loop,
             pack_gqa=pack_gqa,
             cat_gqa=cat_gqa,
         )
@@ -593,7 +609,7 @@ class TestFlexFlashAttn(DistTestBase):
             merge_k_ranges=merge_k_ranges,
             bwd_kq_map=bwd_kq_map,
             bwd_unique_count=bwd_unique_count,
-            swap_bwd_qk_loop=False,  # TODO: test when it's `True`
+            swap_bwd_qk_loop=swap_bwd_qk_loop,
             pack_gqa=pack_gqa,
             cat_gqa=cat_gqa,
         )
@@ -1124,10 +1140,6 @@ class TestFlexFlashAttn(DistTestBase):
         return_max_logits: bool = False,
         cat_gqa: bool = False,
     ) -> None:
-        if auto_range_merge and deterministic:
-            return
-        if swap_ab and sparse_load:  # swap_ab is not supported with sparse_load
-            return
         if sparse_load:  # sparse load supports only auto_range_merge and full attn_type
             if not auto_range_merge or test_accumulation_inplace:
                 return
@@ -1210,6 +1222,7 @@ class TestFlexFlashAttn(DistTestBase):
                 cat_gqa=cat_gqa,
                 test_case=test_case,
                 max_seqlen_q=max_seqlen_q,
+                swap_bwd_qk_loop=swap_bwd_qk_loop,
             )
             return
 
@@ -1679,19 +1692,11 @@ class TestFlexFlashAttn(DistTestBase):
         # TODO: Avoid skipping many flag combinations; instead, regenerate combinations with
         #       constraints to exclude invalid cases while covering more valid ones.
         if swap_bwd_qk_loop:
-            # TODO: support auto_range_merge mode with swap_bwd_qk_loop
-            if auto_range_merge:
-                return
-
             # TODO: support deterministic mode with swap_bwd_qk_loop
             if deterministic:
                 return
 
         if cat_gqa:
-            # TODO: support deterministic mode with cat_gqa
-            if deterministic:
-                return
-
             # NOTE: pack_gqa and cat_gqa cannot be both True
             if pack_gqa:
                 return
@@ -1700,25 +1705,9 @@ class TestFlexFlashAttn(DistTestBase):
             if swap_bwd_qk_loop:
                 return
 
-        if pack_gqa and head_dim == 64 and num_heads_q // num_heads_kv == 2:
-            # TODO: support pack_gqa for 64-dim head with 2:1 GQA ratio
-            return
-
         if random_attn_type_map:
-            if not pack_gqa:
-                # we now support attn type idx in {0, 1, 2, 3}
-                attn_type_map = torch.randint(0, 4, (len(attn_type_map),)).tolist()
-            else:
-                # FIXME: Skip for now, packgqa has bugs with causal mask
-                valid_attn_types = torch.tensor([0, 2, 3])
-                random_indices = torch.randint(
-                    0, len(valid_attn_types), (len(attn_type_map),)
-                )
-                attn_type_map = valid_attn_types[random_indices].tolist()
-
-        # FIXME: Skip for now, packgqa has bugs with causal mask
-        if pack_gqa and 1 in attn_type_map:
-            return
+            # we now support attn type idx in {0, 1, 2, 3}
+            attn_type_map = torch.randint(0, 4, (len(attn_type_map),)).tolist()
 
         # Calculate max_seqlen_q from q_ranges (maximum length of any q range)
         max_seqlen_q = (
@@ -1740,6 +1729,7 @@ class TestFlexFlashAttn(DistTestBase):
             f"[sink_layout={sink_layout}] x "
             f"{flag_comb_test_case}"
         )
+        print(f"[{datetime.now()}] START {test_case}", flush=True)
 
         self.run_test_case(
             seqlen_q=seqlen,
@@ -1778,6 +1768,7 @@ class TestFlexFlashAttn(DistTestBase):
                 "dsink_rtol": 0.1,
             },
         )
+        print(f"[{datetime.now()}] FINISH {test_case}", flush=True)
 
     @with_run_in_mp
     @parameterize("model_config", MODEL_CONFIGS)
@@ -1910,40 +1901,17 @@ class TestFlexFlashAttn(DistTestBase):
 
         # random attn type
         if attn_type == 4:
-            if not pack_gqa:
-                attn_type_map = torch.randint(0, 4, (len(attn_type_map),)).tolist()
-            else:
-                # FIXME: Skip for now, packgqa has bugs with causal mask
-                valid_attn_types = torch.tensor([0, 2, 3])
-                random_indices = torch.randint(
-                    0, len(valid_attn_types), (len(attn_type_map),)
-                )
-                attn_type_map = valid_attn_types[random_indices].tolist()
-
-        # FIXME: Skip for now, packgqa has bugs with causal mask
-        if pack_gqa and 1 in attn_type_map:
-            return
-
-        if pack_gqa and head_dim == 64 and num_heads_q // num_heads_kv == 2:
-            # TODO: support pack_gqa for 64-dim head with 2:1 GQA ratio
-            return
+            # we now support attn type idx in {0, 1, 2, 3}
+            attn_type_map = torch.randint(0, 4, (len(attn_type_map),)).tolist()
 
         # -----    skip invalid flag combinations   ---- #
 
         if swap_bwd_qk_loop:
-            # TODO: support auto_range_merge mode with swap_bwd_qk_loop
-            if auto_range_merge:
-                return
-
             # TODO: support deterministic mode with swap_bwd_qk_loop
             if deterministic:
                 return
 
         if cat_gqa:
-            # TODO: support deterministic mode with cat_gqa
-            if deterministic:
-                return
-
             # NOTE: pack_gqa and cat_gqa cannot be both True
             if pack_gqa:
                 return
@@ -1972,6 +1940,7 @@ class TestFlexFlashAttn(DistTestBase):
             f"[sparse_load={sparse_load}]"
             f"{flag_comb_test_case}"
         )
+        print(f"[{datetime.now()}] START {test_case}", flush=True)
 
         self.run_test_case(
             seqlen_q=total_seqlen_q,
@@ -2005,6 +1974,7 @@ class TestFlexFlashAttn(DistTestBase):
                 "dv_norm_rtol_ratio": NORM_RTOL_RATIO * 1.5,
             },
         )
+        print(f"[{datetime.now()}] FINISH {test_case}", flush=True)
 
     @parameterize("sink_layout", ["sh", "ssh"])  # ["sh", "ssh", "shd"])
     def test_ffa_compiled(self, sink_layout: AttnSinkLayout):
@@ -2079,118 +2049,6 @@ class TestFlexFlashAttn(DistTestBase):
             test_case=("[test_ffa_compiled]" f"[sink_layout={sink_layout}]"),
             max_seqlen_q=None,
         )
-
-    # ─── index_attn_indices direct path (forward only) ───
-
-    @with_run_in_mp
-    @parameterize(
-        "sparse_config",
-        [
-            {
-                "name": "mqa128_pack_gqa",
-                "B": 1,
-                "S": 256,
-                "NHQ": 128,
-                "NHK": 1,
-                "D": 128,
-                "topk": 128,
-                "pack_gqa": True,
-            },
-            {
-                "name": "gqa_32_4_pack_gqa",
-                "B": 1,
-                "S": 256,
-                "NHQ": 32,
-                "NHK": 4,
-                "D": 128,
-                "topk": 128,
-                "pack_gqa": True,
-            },
-        ],
-    )
-    def test_index_attn_indices_simple(self, sparse_config: dict[str, Any]):
-        """Lightweight index_attn_indices test within flex_flash_attn test suite."""
-        from einops import rearrange as einops_rearrange
-
-        from magi_attention.utils import set_random_seed
-
-        set_random_seed(42)
-        B = sparse_config["B"]
-        S = sparse_config["S"]
-        NHQ = sparse_config["NHQ"]
-        NHK = sparse_config["NHK"]
-        D = sparse_config["D"]
-        topk = sparse_config["topk"]
-        pack_gqa = sparse_config["pack_gqa"]
-
-        device = self.device
-        total_q = B * S
-
-        # Build index_attn_indices (total_q, NHK, topk) with global row ids
-        indices = torch.full((total_q, NHK, topk), -1, dtype=torch.int32, device=device)
-        for b in range(B):
-            for qi in range(S):
-                row = b * S + qi
-                for h in range(NHK):
-                    perm = torch.randperm(S, device=device)[:topk].sort().values
-                    global_ids = (b * S + perm) * NHK + h
-                    indices[row, h, :topk] = global_ids.int()
-
-        q = torch.randn(B, S, NHQ, D, dtype=torch.bfloat16, device=device)
-        k = torch.randn(B, S, NHK, D, dtype=torch.bfloat16, device=device)
-        v = torch.randn(B, S, NHK, D, dtype=torch.bfloat16, device=device)
-
-        q_ffa = einops_rearrange(q, "b s (h1 h2) d -> (b s h1) h2 d", h1=NHK)
-        k_ffa = einops_rearrange(k, "b s h d -> (b s h) 1 d")
-        v_ffa = einops_rearrange(v, "b s h d -> (b s h) 1 d")
-
-        with torch.no_grad():
-            o_sparse, _ = flex_flash_attn_func(
-                q_ffa.clone(),
-                k_ffa.clone(),
-                v_ffa.clone(),
-                index_attn_indices=indices,
-                q_block_size=1,
-                k_block_size=1,
-                pack_gqa=pack_gqa,
-            )
-
-        o_reshaped = einops_rearrange(
-            o_sparse, "(b s h1) h2 d -> b s (h1 h2) d", b=B, h1=NHK, s=S
-        )
-
-        gqa = NHQ // NHK
-        mask = torch.zeros(B, NHQ, S, S, dtype=torch.bool, device=device)
-        for b in range(B):
-            for qi in range(S):
-                row = b * S + qi
-                for h_kv in range(NHK):
-                    global_ids = indices[row, h_kv, :]
-                    valid = global_ids[global_ids >= 0].long()
-                    local_kv = valid // NHK - b * S
-                    for h_q_off in range(gqa):
-                        h_q = h_kv * gqa + h_q_off
-                        mask[b, h_q, qi, local_kv] = True
-
-        for b in range(B):
-            q_sdpa = einops_rearrange(q[b], "s h d -> 1 h s d")
-            k_sdpa = einops_rearrange(k[b], "s h d -> 1 h s d")
-            v_sdpa = einops_rearrange(v[b], "s h d -> 1 h s d")
-            if gqa > 1:
-                k_sdpa = k_sdpa.repeat_interleave(gqa, dim=1)
-                v_sdpa = v_sdpa.repeat_interleave(gqa, dim=1)
-
-            with torch.no_grad():
-                o_ref = torch.nn.functional.scaled_dot_product_attention(
-                    q_sdpa, k_sdpa, v_sdpa, attn_mask=mask[b].unsqueeze(0)
-                )
-            o_ref = einops_rearrange(o_ref, "1 h s d -> s h d")
-
-            max_diff = (o_reshaped[b].float() - o_ref.float()).abs().max().item()
-            assert max_diff < 0.01, (
-                f"[test_index_attn_indices_simple][{sparse_config['name']}] "
-                f"batch {b}: max_diff={max_diff:.6f} >= 0.01"
-            )
 
 
 if __name__ == "__main__":

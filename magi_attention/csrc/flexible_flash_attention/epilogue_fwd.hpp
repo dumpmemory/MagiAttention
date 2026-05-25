@@ -27,6 +27,7 @@
 #include "cutlass/epilogue/collective/builders/sm90_common.inl"
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
 
+#include "deterministic.h"
 #include "named_barrier.hpp"
 #include "seqlen.h"
 #include "softmax.h"
@@ -330,67 +331,7 @@ struct CollectiveEpilogueFwd {
     atomicExch(&range_lock[index_1], 0);
   }
 
-  CUTLASS_DEVICE
-  void deterministic_sync(int* range_lock, int bidh, int offset, int q_block_size, int num_heads, int left_range_sync_num, int right_range_sync_num) {
-    if (left_range_sync_num == 0 && right_range_sync_num == 0)
-      return;
-
-    // Calculate lock index
-    int left_range_block_idx = offset / q_block_size;
-    int left_range_index = left_range_block_idx * num_heads + bidh;
-    int right_range_block_idx = (offset + q_block_size - 1) / q_block_size;
-
-#pragma unroll 1
-    // Acquire the first lock
-    while (atomicCAS(&range_lock[left_range_index * 2], left_range_sync_num, left_range_sync_num) != left_range_sync_num) {
-    }
-
-    // If we need a second lock
-    if (left_range_block_idx != right_range_block_idx) {
-      int right_range_index = right_range_block_idx * num_heads + bidh;
-
-#pragma unroll 1
-      // Try to acquire the second lock
-      while (atomicCAS(&range_lock[right_range_index * 2], right_range_sync_num, right_range_sync_num) != right_range_sync_num) {
-      }
-    }
-  }
-
-  CUTLASS_DEVICE
-  void deterministic_arrive(
-      int* range_lock,
-      int bidh,
-      int offset,
-      int q_block_size,
-      int num_heads,
-      int arrive_num,
-      bool left_range_arrive_twice,
-      bool right_range_arrive_twice) {
-    // Calculate lock indices
-    int left_range_block_idx = offset / q_block_size;
-    int left_range_index = left_range_block_idx * num_heads + bidh;
-    int right_range_block_idx = (offset + q_block_size - 1) / q_block_size;
-    int right_range_index = right_range_block_idx * num_heads + bidh;
-
-    // Release the second lock
-    int add_cnt = right_range_arrive_twice ? 2 : 1;
-    int tmp = atomicAdd(&range_lock[right_range_index * 2 + 1], add_cnt);
-    // each range_lock needs to arrive twice to make sure conflict batch has been completed
-    if (tmp + add_cnt == 2) {
-      atomicExch(&range_lock[right_range_index * 2 + 1], 0);
-      atomicExch(&range_lock[right_range_index * 2], arrive_num);
-    }
-
-    // Release the first lock
-    add_cnt = left_range_arrive_twice ? 2 : 1;
-    tmp = atomicAdd(&range_lock[left_range_index * 2 + 1], add_cnt);
-    if (tmp + add_cnt == 2) {
-      atomicExch(&range_lock[left_range_index * 2 + 1], 0);
-      atomicExch(&range_lock[left_range_index * 2], arrive_num);
-    }
-  }
-
-  template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma, typename... Args>
+  template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma, typename DetMsgT, typename... Args>
   CUTLASS_DEVICE void store(
       Params const& params,
       FrgTensorO& tOrO,
@@ -400,6 +341,7 @@ struct CollectiveEpilogueFwd {
       int thread_idx,
       BlockCoordType const& block_coord,
       flash::SeqlenInfo& seqlen_info,
+      DetMsgT const& det_msg,
       Args&&... args) {
     // Extract block coordinates
     // bidh here is:
@@ -465,8 +407,8 @@ struct CollectiveEpilogueFwd {
       // Acquire range lock to prevent multiple threads from writing to gmem simultaneously
       if (thread_idx == 0) {
         if constexpr (Deterministic) {
-          int left_range_conflict_msg = get<3>(block_coord);
-          int right_range_conflict_msg = get<4>(block_coord);
+          int left_range_conflict_msg = get<0>(det_msg);
+          int right_range_conflict_msg = get<1>(det_msg);
 
           deterministic_sync(
               params.determin_range_locks,
@@ -708,9 +650,9 @@ struct CollectiveEpilogueFwd {
       BarrierManager::sync<NumEpilogueThreads>(resv_barrier::EpilogueBarrier);
       if (thread_idx == 0) {
         if constexpr (Deterministic) {
-          int left_range_conflict_msg = get<3>(block_coord);
-          int right_range_conflict_msg = get<4>(block_coord);
-          int arrive_num = get<5>(block_coord) + 1;
+          int left_range_conflict_msg = get<0>(det_msg);
+          int right_range_conflict_msg = get<1>(det_msg);
+          int arrive_num = get<2>(det_msg) + 1;
 
           deterministic_arrive(
               params.determin_range_locks,
@@ -825,23 +767,21 @@ struct CollectiveEpilogueFwd {
   }
 
   // Write 0 to output and -inf to LSE
-  CUTLASS_DEVICE void store_zero(Params const& params, int thread_idx, BlockCoordType const& block_coord, flash::SeqlenInfo& seqlen_info) {
+  template <typename DetMsgT = cute::tuple<>>
+  CUTLASS_DEVICE void store_zero(Params const& params, int thread_idx, BlockCoordType const& block_coord, flash::SeqlenInfo& seqlen_info, DetMsgT const& det_msg = {}) {
     static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
     static_assert(kBlockM <= NumEpilogueThreads);
 
-    // Get block coordinates for current job(tile)
     int m_block = get<0>(block_coord);
     int bidh = get<1>(block_coord);
     int bidb = get<2>(block_coord);
-    // Get offset and seqlen for batch that current tile belongs to
     int const offset_o = !PackGQA ? seqlen_info.offset_q : seqlen_info.offset_q * QheadPerKhead;
 
     if constexpr (!DisableFwdAtomicReduction) {
-      // Acquire range lock to prevent multiple threads from writing to gmem simultaneously
       if (thread_idx == 0) {
         if constexpr (Deterministic) {
-          int left_range_conflict_msg = get<3>(block_coord);
-          int right_range_conflict_msg = get<4>(block_coord);
+          int left_range_conflict_msg = get<0>(det_msg);
+          int right_range_conflict_msg = get<1>(det_msg);
           deterministic_sync(
               params.determin_range_locks,
               bidh,
@@ -855,12 +795,11 @@ struct CollectiveEpilogueFwd {
     }
 
     if constexpr (!DisableFwdAtomicReduction) {
-      // Make sure all writes to global memory before this point are completed
       if (thread_idx == 0) {
         if constexpr (Deterministic) {
-          int left_range_conflict_msg = get<3>(block_coord);
-          int right_range_conflict_msg = get<4>(block_coord);
-          int arrive_num = get<5>(block_coord) + 1;
+          int left_range_conflict_msg = get<0>(det_msg);
+          int right_range_conflict_msg = get<1>(det_msg);
+          int arrive_num = get<2>(det_msg) + 1;
 
           deterministic_arrive(
               params.determin_range_locks,

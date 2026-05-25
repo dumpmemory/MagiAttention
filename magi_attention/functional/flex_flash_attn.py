@@ -755,11 +755,6 @@ class FlexFlashAttnFunc(torch.autograd.Function):
                 "When disable_bwd_dkv_atomic_reduction is true, swap_bwd_qk_loop must be false."
             )
 
-        if pack_gqa:
-            assert (
-                q.size(1) / k.size(1) != 2
-            ), "pack_gqa with qhead_per_khead=2 is not supported yet."
-
         # ---- FA4 backend fast path ---- #
         if env.general.kernel_backend() == MagiAttentionKernelBackend.FA4:
             q_ranges_list = q_ranges.cpu().tolist()
@@ -814,7 +809,7 @@ class FlexFlashAttnFunc(torch.autograd.Function):
 
             with maybe_profile_ffa_ctx("fwd_sparse_load_preprocess"):
                 if sparse_load:
-                    tile_size = 128  # tile size (number of tokens) for sparse load K/V from gmem to smem
+                    tile_size = 64 if swap_ab else 128
                     # calculate the sum of K ranges of unique Q range，ceil_div(tile_size) to get the loop count of sparse load
                     (
                         sparse_load_loop_count,
@@ -830,7 +825,7 @@ class FlexFlashAttnFunc(torch.autograd.Function):
                     if ref_block_size is not None:
                         ref_block_size = (ref_block_size[0], tile_size)
                     else:
-                        ref_block_size = (128, tile_size)
+                        ref_block_size = (64 if swap_ab else 128, tile_size)
                 else:
                     sparse_load_loop_count = None
                     sparse_load_invalid_count = None
@@ -964,14 +959,26 @@ class FlexFlashAttnFunc(torch.autograd.Function):
 
         if ctx.auto_range_merge:
             with maybe_profile_ffa_ctx("bwd_range_merge"):
-                (
-                    merge_k_ranges,
-                    bwd_k_ranges,
-                    bwd_q_ranges,
-                    bwd_attn_type_map,
-                    bwd_kq_map,
-                    bwd_unique_count,
-                ) = merge_ranges(k_ranges, q_ranges, attn_type_map=attn_type_map)
+                if ctx.swap_bwd_qk_loop:
+                    # LoopK: outer loop is Q (m_blocks), merge by Q ranges
+                    (
+                        merge_k_ranges,  # actually merge_q_ranges, reusing the same variable name for C++ API compat
+                        bwd_q_ranges,
+                        bwd_k_ranges,
+                        bwd_attn_type_map,
+                        bwd_kq_map,
+                        bwd_unique_count,
+                    ) = merge_ranges(q_ranges, k_ranges, attn_type_map=attn_type_map)
+                else:
+                    # LoopQ: outer loop is K (n_blocks), merge by K ranges
+                    (
+                        merge_k_ranges,
+                        bwd_k_ranges,
+                        bwd_q_ranges,
+                        bwd_attn_type_map,
+                        bwd_kq_map,
+                        bwd_unique_count,
+                    ) = merge_ranges(k_ranges, q_ranges, attn_type_map=attn_type_map)
         else:
             bwd_q_ranges, bwd_k_ranges, bwd_attn_type_map = (
                 q_ranges,
@@ -1380,10 +1387,9 @@ def flex_flash_attn_func(
         else:
             ref_block_size = (64 if swap_ab else 128, tile_size)
 
-    assert not (auto_range_merge and deterministic), (
-        "auto_range_merge and deterministic can't be True at the same time, "
-        "due to some unresolved bug to be fixed as soon as possible."
-    )
+    assert not (
+        swap_bwd_qk_loop and deterministic
+    ), "Deterministic mode is not supported when swap_bwd_qk_loop is enabled."
 
     if env.general.kernel_backend() == MagiAttentionKernelBackend.FA4:
         assert is_fa4_installed, (
