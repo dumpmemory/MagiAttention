@@ -555,7 +555,7 @@ struct CollectiveMainloopFwdSm90 {
       }();
 
       Tensor gQ = local_tile(
-          domain_offset(make_coord(block_meta.seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(block_meta.m_block, _0{})); // (M, K)
+          domain_offset(make_coord(block_meta.seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(block_meta.outer_block, _0{})); // (M, K)
       Tensor gQ_Packed = [&]() {
         if constexpr (PackGQA) {
           return local_tile(
@@ -563,7 +563,7 @@ struct CollectiveMainloopFwdSm90 {
                   make_coord(block_meta.seqlen_info.offset_q * QheadPerKhead, _0{}),
                   mQ_Packed), // for packgqa, we need multiple qhead_per_khead for offset of seqlen;
               select<0, 2>(TileShape_MNK{}),
-              make_coord(block_meta.m_block, _0{})); // (M // qhead_per_khead, K, qhead_per_khead)
+              make_coord(block_meta.outer_block, _0{})); // (M // qhead_per_khead, K, qhead_per_khead)
         } else {
           return gQ;
         }
@@ -736,7 +736,7 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         // Prefetch advances cur_loop and updates token_indices/prev_token_indices
-        int n_block_max = block_meta.loop_count;
+        int n_block_max = block_meta.inner_block_max;
         while (true) {
           block_meta.prefetch();
           int n_block = block_meta.cur_loop;
@@ -761,25 +761,11 @@ struct CollectiveMainloopFwdSm90 {
     int n_block, n_block_min, offset_k;
     int prev_n_block, prev_offset_k;
 
-    bool is_first_batch = true;
-    while (true) {
-      block_meta.skip_to_first_valid();
-      if (block_meta.is_finish())
-        break;
-
-      if (is_first_batch) {
-        load_Q_and_wait_barrier_O();
-        is_first_batch = false;
-      } else if constexpr (IntraWGOverlap) {
-        // Cross-batch V: the previous batch's last V was deferred (IntraWGOverlap
-        // loads V one step behind K). Emit it now before starting new batch's K.
-        load_V(prev_n_block, prev_offset_k);
-      }
-
+    auto load_kv_body = [&]() {
       // Read per-batch variables
-      n_block = block_meta.n_block_max - 1;
+      n_block = block_meta.inner_block_max - 1;
       offset_k = block_meta.seqlen_info.offset_k;
-      n_block_min = block_meta.n_block_min;
+      n_block_min = block_meta.inner_block_min;
 
       // Load first K (+ V if !IntraWGOverlap) for this batch
       load_K(n_block, offset_k);
@@ -804,7 +790,36 @@ struct CollectiveMainloopFwdSm90 {
         prev_offset_k = offset_k;
         --n_block;
       }
+    };
 
+    if constexpr (!BlockMetaT::NeedsBatchLoop) {
+      if (!block_meta.is_valid()) {
+        return false;
+      }
+      load_Q_and_wait_barrier_O();
+      load_kv_body();
+      if constexpr (IntraWGOverlap) {
+        load_V(prev_n_block, prev_offset_k);
+      }
+      return true;
+    }
+
+    bool is_first_batch = true;
+    while (true) {
+      block_meta.skip_to_first_valid();
+      if (block_meta.is_finish())
+        break;
+
+      if (is_first_batch) {
+        load_Q_and_wait_barrier_O();
+        is_first_batch = false;
+      } else if constexpr (IntraWGOverlap) {
+        // Cross-batch V: the previous batch's last V was deferred (IntraWGOverlap
+        // loads V one step behind K). Emit it now before starting new batch's K.
+        load_V(prev_n_block, prev_offset_k);
+      }
+
+      load_kv_body();
       block_meta.prefetch();
     }
 
@@ -1050,11 +1065,11 @@ struct CollectiveMainloopFwdSm90 {
 
     // Dense-path mask functions (compiled away when SparseLoad/IndexAttn=true)
     auto boundary_mask_fn = [&](auto& tSrS, int n_block, auto const& attn_type, int const& seqlen_q, int const& seqlen_k) {
-      mask.template apply</*Seqlenk_mask=*/true, PackGQA, QheadPerKhead>(tSrS, block_meta.m_block, n_block, attn_type, thread_idx, seqlen_q, seqlen_k);
+      mask.template apply</*Seqlenk_mask=*/true, PackGQA, QheadPerKhead>(tSrS, block_meta.outer_block, n_block, attn_type, thread_idx, seqlen_q, seqlen_k);
     };
     auto no_mask_fn = [&](auto& tSrS, int n_block, auto const& attn_type, int const& seqlen_q, int const& seqlen_k) { /*do nothing*/ };
     auto regular_mask_fn = [&](auto& tSrS, int n_block, auto const& attn_type, int const& seqlen_q, int const& seqlen_k) {
-      mask.template apply</*Seqlenk_mask=*/false, PackGQA, QheadPerKhead>(tSrS, block_meta.m_block, n_block, attn_type, thread_idx, seqlen_q, seqlen_k);
+      mask.template apply</*Seqlenk_mask=*/false, PackGQA, QheadPerKhead>(tSrS, block_meta.outer_block, n_block, attn_type, thread_idx, seqlen_q, seqlen_k);
     };
 
     int n_block_max, n_block, seqlen_k, n_block_min;
@@ -1205,57 +1220,77 @@ struct CollectiveMainloopFwdSm90 {
       }
     };
 
-    bool is_first_batch = true;
-    while (true) {
-      block_meta.skip_to_first_valid();
-      if (block_meta.is_finish())
-        break;
+    auto mma_dense_body = [&]() {
+      flash::apply_causal_partition<kBlockM, kBlockN>(
+          n_block,
+          n_block_min,
+          block_meta.outer_block,
+          block_meta.seqlen_info.seqlen_q,
+          seqlen_k,
+          attn_type,
+          [&](int nb, auto mask_fn, auto is_no_mask) {
+            using CheckInf = std::conditional_t<decltype(is_no_mask)::value, cute::false_type, cute::true_type>;
+            fwd_step(nb, mask_fn, CheckInf{});
+          },
+          boundary_mask_fn,
+          regular_mask_fn,
+          no_mask_fn);
+    };
 
-      n_block_max = block_meta.n_block_max;
+    if constexpr (!BlockMetaT::NeedsBatchLoop) {
+      if (!block_meta.is_valid()) {
+        return false;
+      }
+      n_block_max = block_meta.inner_block_max;
       n_block = n_block_max - 1;
       seqlen_k = block_meta.seqlen_info.seqlen_k;
-      n_block_min = block_meta.n_block_min;
+      n_block_min = block_meta.inner_block_min;
       attn_type = block_meta.attn_type;
 
-      if (is_first_batch) {
-        barrier_Q.wait(work_idx % 2);
-        mma_head(n_block, attn_type, seqlen_k, /*is_first_ever=*/true);
-        --n_block;
-        is_first_batch = false;
-      }
+      barrier_Q.wait(work_idx % 2);
+      mma_head(n_block, attn_type, seqlen_k, /*is_first_ever=*/true);
+      --n_block;
 
-      if constexpr (SparseLoad || IndexAttn) {
-        while (true) {
-          block_meta.prefetch();
-          if (block_meta.is_finish())
-            break;
-          n_block = n_block_max - 1 - block_meta.cur_loop;
-          if (n_block >= n_block_min) {
-            fwd_step(n_block, no_mask_fn, cute::true_type{} /*check_inf*/);
-          }
+      mma_dense_body();
+    } else {
+      bool is_first_batch = true;
+      while (true) {
+        block_meta.skip_to_first_valid();
+        if (block_meta.is_finish())
+          break;
+
+        n_block_max = block_meta.inner_block_max;
+        n_block = n_block_max - 1;
+        seqlen_k = block_meta.seqlen_info.seqlen_k;
+        n_block_min = block_meta.inner_block_min;
+        attn_type = block_meta.attn_type;
+
+        if (is_first_batch) {
+          barrier_Q.wait(work_idx % 2);
+          mma_head(n_block, attn_type, seqlen_k, /*is_first_ever=*/true);
+          --n_block;
+          is_first_batch = false;
         }
-      } else {
-        flash::apply_causal_partition<kBlockM, kBlockN>(
-            n_block,
-            n_block_min,
-            block_meta.m_block,
-            block_meta.seqlen_info.seqlen_q,
-            seqlen_k,
-            attn_type,
-            [&](int nb, auto mask_fn, auto is_no_mask) {
-              using CheckInf = std::conditional_t<decltype(is_no_mask)::value, cute::false_type, cute::true_type>;
-              fwd_step(nb, mask_fn, CheckInf{});
-            },
-            boundary_mask_fn,
-            regular_mask_fn,
-            no_mask_fn);
 
-        block_meta.prefetch();
+        if constexpr (SparseLoad || IndexAttn) {
+          while (true) {
+            block_meta.prefetch();
+            if (block_meta.is_finish())
+              break;
+            n_block = n_block_max - 1 - block_meta.cur_loop;
+            if (n_block >= n_block_min) {
+              fwd_step(n_block, no_mask_fn, cute::true_type{} /*check_inf*/);
+            }
+          }
+        } else {
+          mma_dense_body();
+          block_meta.prefetch();
+        }
       }
-    }
 
-    if (is_first_batch) {
-      return false;
+      if (is_first_batch) {
+        return false;
+      }
     }
 
     if constexpr (!SparseLoad && !IndexAttn) {
