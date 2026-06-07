@@ -72,6 +72,17 @@ struct enable_sm80_to_sm89 : Kernel {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Resolve the [start, end) token range for batch `bidb`.
+// `ranges == nullptr` is the IndexAttn convention: every "batch" is a single
+// query token, so its range is {bidb, bidb + 1}; otherwise read it from gmem.
+// Takes `int2 const*` so the scheduler (`int2* const ranges`) and the epilogue
+// (`int2 const* k_ranges/q_ranges`) share a single definition.
+CUTLASS_DEVICE int2 get_batch_range(int2 const* ranges, int bidb) {
+  return ranges != nullptr ? ranges[bidb] : make_int2(bidb, bidb + 1);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename T>
 struct MaxOp {
   __device__ __forceinline__ T operator()(T const& x, T const& y) {
@@ -911,26 +922,6 @@ CUTLASS_DEVICE cute::tuple<uint16_t, uint32_t> get_tma_multi_cast_meta() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-CUTLASS_DEVICE
-void cp_async_cacheglobal_l2_prefetch_256B(const void* src, void* dst, bool pred, int64_t cache_policy) {
-  uint32_t dst_addr = cute::cast_smem_ptr_to_uint(dst);
-  asm volatile("cp.async.cg.shared.global.L2::cache_hint.L2::256B [%0], [%1], 16, %2, %3;\n" ::"r"(dst_addr), "l"(src), "r"(pred ? 16 : 0), "l"(cache_policy));
-}
-
-CUTLASS_DEVICE
-int64_t createpolicy_evict_last() {
-  int64_t res;
-  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0; \n\t" : "=l"(res) :);
-  return res;
-}
-
-CUTLASS_DEVICE
-int64_t createpolicy_evict_first() {
-  int64_t res;
-  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0; \n\t" : "=l"(res) :);
-  return res;
-}
 
 // Define available cache operators matching PTX instructions
 enum class LoadMode {

@@ -213,61 +213,147 @@ struct Mask {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// apply_causal_partition: Unified 4-stage causal mask partitioning for FWD and BWD.
+// Unified mask dispatch: partitions iteration space into Causal/InvCausal diagonal
+// and no-mask regions based on attention type, then dispatches appropriate mask_fn.
 //
-// Traverses n_blocks right-to-left through 4 stages:
-//   1. Boundary block (rightmost, seqlen_k may not align to kBlockN)
-//   2. Causal diagonal (Causal/BiCausal top-right)
-//   3. No-mask fast path (zero mask overhead)
-//   4. InvCausal left boundary (InvCausal/BiCausal bottom-left)
+// Template parameters:
+//   Axis: N = iterate over K-blocks (fixed m_block), M = iterate over Q-blocks (fixed n_block)
+//   Direction: MinToMax = ascending, MaxToMin = descending
+//   PackGQA/QheadPerKhead: only used when Axis=M (m-direction needs packed/logical conversion)
 //
-// step_fn(n_block, mask_fn, is_no_mask_stage):
+// seqlen_q: always LOGICAL (= seqlen_info.seqlen_q, unscaled by PackGQA).
+//
+// step_fn(block, mask_fn, is_no_mask_stage):
 //   - mask_fn: one of {boundary_fn, regular_fn, no_mask_fn}
-//   - is_no_mask_stage: cute::true_type for stage 3, cute::false_type otherwise
-//     (enables compile-time branching, e.g. FWD's check_inf optimization)
+//   - is_no_mask_stage: cute::true_type for no-mask zones, cute::false_type otherwise
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int kBlockM, int kBlockN, typename StepFn, typename BoundaryMaskFn, typename RegularMaskFn, typename NoMaskFn>
-CUTLASS_DEVICE void apply_causal_partition(
-    int n_block,
-    int n_block_min,
-    int m_block,
-    int seqlen_q,
-    int seqlen_k,
-    flash::AttnType attn_type,
-    StepFn&& step_fn,
-    BoundaryMaskFn&& boundary_fn,
-    RegularMaskFn&& regular_fn,
-    NoMaskFn&& no_mask_fn) {
-  if (n_block < n_block_min)
-    return;
+enum class DispatchAxis { N, M };
+enum class DispatchDirection { MinToMax, MaxToMin };
 
-  // Stage 1: boundary (rightmost block, seqlen_k may not align to kBlockN)
-  if (seqlen_k % kBlockN == 0 && attn_type == flash::AttnType::Full)
-    step_fn(n_block, no_mask_fn, cute::false_type{});
-  else
-    step_fn(n_block, boundary_fn, cute::false_type{});
-  --n_block;
-
-  // Stage 2: causal diagonal (Causal/BiCausal top-right)
-  if (attn_type == flash::AttnType::Causal || attn_type == flash::AttnType::BiCausal) {
-    int const n_min_causal = max(n_block_min, (m_block * kBlockM + seqlen_k - seqlen_q) / kBlockN);
-    CUTLASS_PRAGMA_NO_UNROLL
-    for (; n_block >= n_min_causal; --n_block)
-      step_fn(n_block, regular_fn, cute::false_type{});
-  }
-
-  // Stage 3: no-mask fast path (full attention, zero overhead)
-  int const n_min_inv = (attn_type == flash::AttnType::Full || attn_type == flash::AttnType::Causal) ? n_block_min : cute::ceil_div((m_block + 1) * kBlockM, kBlockN);
-  CUTLASS_PRAGMA_NO_UNROLL
-  for (; n_block >= n_min_inv; --n_block)
-    step_fn(n_block, no_mask_fn, cute::true_type{});
-
-  // Stage 4: inv-causal left boundary (InvCausal/BiCausal bottom-left)
-  if (attn_type == flash::AttnType::InvCausal || attn_type == flash::AttnType::BiCausal) {
-    CUTLASS_PRAGMA_NO_UNROLL
-    for (; n_block >= n_block_min; --n_block)
-      step_fn(n_block, regular_fn, cute::false_type{});
+template <DispatchDirection Dir>
+CUTLASS_DEVICE int init_block_cur(int lo, int hi) {
+  if constexpr (Dir == DispatchDirection::MaxToMin) {
+    return hi - 1;
+  } else {
+    return lo;
   }
 }
+
+template <DispatchDirection Dir>
+CUTLASS_DEVICE void advance_block_cur(int& block_cur) {
+  if constexpr (Dir == DispatchDirection::MaxToMin) {
+    --block_cur;
+  } else {
+    ++block_cur;
+  }
+}
+
+template <DispatchDirection Dir, int Unroll = 1, typename BodyFn>
+CUTLASS_DEVICE void iterate_range(int& cursor, int lo, int hi, BodyFn body) {
+  if constexpr (Dir == DispatchDirection::MaxToMin) {
+#pragma unroll Unroll
+    while (cursor >= lo) {
+      body();
+      --cursor;
+    }
+  } else {
+#pragma unroll Unroll
+    for (; cursor < hi;) {
+      body();
+      ++cursor;
+    }
+  }
+}
+
+// Single-instantiation mask dispatch: computes zone boundaries internally,
+// applies mask directly via MaskT::apply, and calls step_fn exactly once per block.
+// This avoids code bloat from multiple step_fn instantiations with different mask types.
+//
+// BlockMetaT must provide: outer_block, inner_block_min, inner_block_max,
+//   seqlen_info.seqlen_q, seqlen_info.seqlen_k, attn_type.
+// MaskT must provide: apply<Seqlenk_mask, PackGQA, QheadPerKhead>(tSrS, m_block, n_block, ...).
+template <
+    int kBlockM,
+    int kBlockN,
+    bool PackGQA,
+    int QheadPerKhead,
+    DispatchAxis Axis,
+    DispatchDirection Direction,
+    typename BlockMetaT,
+    typename MaskT,
+    typename TensorS,
+    typename StepFn>
+CUTLASS_DEVICE void mask_dispatch_unified(BlockMetaT const& block_meta, MaskT const& mask, TensorS& tSrS, int thread_idx, StepFn&& step_fn) {
+  constexpr bool is_N = (Axis == DispatchAxis::N);
+  constexpr int kBlockOuter = is_N ? kBlockN : kBlockM;
+
+  int const block_lo = block_meta.inner_block_min;
+  int const block_hi = block_meta.inner_block_max;
+  int const fixed_block = block_meta.outer_block;
+  int const seqlen_q = block_meta.seqlen_info.seqlen_q;
+  int const seqlen_k = block_meta.seqlen_info.seqlen_k;
+  auto const attn_type = block_meta.attn_type;
+
+  int const pack_factor = (!is_N && PackGQA) ? QheadPerKhead : 1;
+  int const seqlen_outer = is_N ? seqlen_k : seqlen_q * pack_factor;
+  bool const cross_axis_boundary = !is_N && ((fixed_block + 1) * kBlockN > seqlen_k);
+
+  bool const has_causal = (attn_type == flash::AttnType::Causal || attn_type == flash::AttnType::BiCausal);
+  bool const has_inv = (attn_type == flash::AttnType::InvCausal || attn_type == flash::AttnType::BiCausal);
+
+  // Zone boundaries
+  int small_end, large_end;
+  if constexpr (is_N) {
+    small_end = has_inv ? min(block_hi, cute::ceil_div((fixed_block + 1) * kBlockM, kBlockN)) : block_lo;
+    large_end = has_causal ? max(block_lo, (fixed_block * kBlockM + seqlen_k - seqlen_q) / kBlockN) : block_hi;
+  } else {
+    int const cv = ((fixed_block + 1) * kBlockN - (seqlen_k - seqlen_q)) * pack_factor;
+    small_end = has_causal ? (cv <= 0 ? block_lo : min(block_hi, cute::ceil_div(cv, kBlockM))) : block_lo;
+    large_end = has_inv ? min(block_hi, (fixed_block * kBlockN + 1) * pack_factor / kBlockM) : block_hi;
+  }
+  bool const has_small_mask = is_N ? has_inv : has_causal;
+  bool const has_large_mask = is_N ? has_causal : has_inv;
+
+  int const last_block = block_hi - 1;
+  bool const last_block_no_mask = !cross_axis_boundary && (seqlen_outer % kBlockOuter == 0) && (attn_type == flash::AttnType::Full);
+
+  // Internal mask application: dispatches m_block/n_block based on Axis.
+  // Axis=N: fixed_block is m_block, block is n_block.
+  // Axis=M: block is m_block, fixed_block is n_block.
+  auto apply_mask = [&](int block, bool seqlenk_mask) {
+    int const m_blk = is_N ? fixed_block : block;
+    int const n_blk = is_N ? block : fixed_block;
+    if (seqlenk_mask)
+      mask.template apply</*Seqlenk_mask=*/true, PackGQA, QheadPerKhead>(tSrS, m_blk, n_blk, attn_type, thread_idx, seqlen_q, seqlen_k);
+    else
+      mask.template apply</*Seqlenk_mask=*/false, PackGQA, QheadPerKhead>(tSrS, m_blk, n_blk, attn_type, thread_idx, seqlen_q, seqlen_k);
+  };
+
+  // Unified mask function: ONE lambda type, runtime dispatch.
+  // seqlenk_mask=true  → boundary_fn (diagonal mask + seqlen clipping)
+  // seqlenk_mask=false → regular_fn  (diagonal mask only)
+  // else (no call)     → no_mask_fn  (fully visible, skip mask entirely)
+  auto unified_mask_fn = [&](int block) {
+    if (block == last_block && !last_block_no_mask) {
+      apply_mask(block, /*seqlenk_mask=*/true); // boundary: last block may have seqlen padding
+    } else if ((has_small_mask && block < small_end) || (has_large_mask && block >= large_end)) {
+      apply_mask(block, /*seqlenk_mask=*/false); // diagonal zone: causal/inv_causal mask
+    } else if (cross_axis_boundary) {
+      apply_mask(block, /*seqlenk_mask=*/true); // M-axis: fixed n_block exceeds seqlen_k
+    }
+    // else: no mask needed — block is fully visible
+  };
+
+  // Use inner_block_cur as traversal start (may differ from init_block_cur after head processing).
+  // FWD: mma_head already processed the first block and advanced inner_block_cur,
+  //      so we must start from the advanced position, not from block_lo/block_hi.
+  // BWD: no mma_head pre-processing, inner_block_cur == init_block_cur(block_lo, block_hi).
+  int block_cur = block_meta.inner_block_cur;
+  iterate_range<Direction>(block_cur, block_lo, block_hi, [&] { step_fn(block_cur, unified_mask_fn, cute::false_type{}); });
+}
+
+// NOTE: mask_dispatch (3-lambda, 3x instantiation) has been removed.
+// All call sites now use mask_dispatch_unified (single instantiation, runtime dispatch).
+
 } // namespace flash

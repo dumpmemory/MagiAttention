@@ -55,15 +55,14 @@ template <
     bool SwapAB,
     bool SparseLoad,
     bool IndexAttn,
-    bool ReturnMaxLogits,
+    bool IntraWGOverlap = true,
+    bool InnerDirMaxToMin,
+    bool ReturnMaxLogits = false,
     bool ProfileMode = false>
 void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   static_assert(!(SparseLoad && IndexAttn), "SparseLoad and IndexAttn cannot be enabled at the same time");
   using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
-  // Get tile size and kernel configuration for SM90
-  // if SwapAB, mma V @ P is SS mode
   static constexpr bool MmaPV_is_RS = !SwapAB;
-  static constexpr bool IntraWGOverlap = true;
 
   static constexpr int kStages = 2;
 
@@ -90,7 +89,8 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       QheadPerKhead,
       SwapAB,
       SparseLoad,
-      IndexAttn>;
+      IndexAttn,
+      InnerDirMaxToMin>;
 
   using Scheduler = flash::DynamicPersistentTileSchedulerFwd<
       kBlockM,
@@ -115,7 +115,7 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       SwapAB,
       ReturnMaxLogits>;
 
-  using AttnKernel = flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler, RangeMerge>>;
+  using AttnKernel = flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler, RangeMerge, InnerDirMaxToMin>>;
 
   typename CollectiveMainloop::StrideV v_strides = make_stride(params.v_row_stride, _1{}, params.v_head_stride);
   typename CollectiveMainloop::Arguments mainloop_args = [&]() {
@@ -135,10 +135,8 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
         params.k_ranges,
         params.attn_type_map,
         params.qk_map,
-        params.sparse_load_loop_count, // loop count for each unique Q range when sparse load
-        params.sparse_load_invalid_count, // invalid token count for each unique Q range when sparse load
-        params.equal_k_range_size, // whether all K ranges are of equal size
-        params.index_attn_indices, // [num_unique_q, max_topk] int32 global KV row ids
+        params.equal_k_range_size,
+        params.index_attn_indices,
         params.index_attn_max_topk};
   }();
 
@@ -221,6 +219,8 @@ template <
     bool SwapAB,
     bool kSparseLoad,
     bool kIndexAttn,
+    bool kIntraWGOverlap,
+    bool kInnerDirMaxToMin,
     bool kReturnMaxLogits,
     bool kProfileMode>
 void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
@@ -250,6 +250,8 @@ void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
         /*SwapAB=*/SwapAB,
         /*SparseLoad=*/kSparseLoad,
         /*IndexAttn=*/kIndexAttn,
+        /*IntraWGOverlap=*/kIntraWGOverlap,
+        /*InnerDirMaxToMin=*/kInnerDirMaxToMin,
         /*ReturnMaxLogits=*/kReturnMaxLogits,
         /*ProfileMode=*/kProfileMode>(params, stream);
   });

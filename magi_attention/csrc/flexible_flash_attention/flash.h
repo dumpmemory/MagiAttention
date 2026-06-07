@@ -110,10 +110,8 @@ struct Flash_fwd_params : public Qkv_params {
   int num_sm;
   int* __restrict__ tile_count_semaphore;
 
-  // Sparse load params
-  int* __restrict__ sparse_load_loop_count;
-  uint8_t* __restrict__ sparse_load_invalid_count;
-  int* __restrict__ equal_k_range_size;
+  // SparseLoad: all K ranges have equal size, enables O(1) cursor seek.
+  bool equal_k_range_size;
 
   // IndexAttn indices direct path params
   // Kernel scans trailing -1 entries to compute loop_count / invalid_count.
@@ -186,6 +184,10 @@ struct Flash_bwd_params : public Flash_fwd_params {
   // Deterministic params
   int* __restrict__ dq_determin_conflict_state;
   int* __restrict__ dq_determin_range_locks;
+
+  // IndexAttn params
+  int* __restrict__ index_attn_indices;
+  int index_attn_max_topk;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -206,6 +208,8 @@ template <
     bool SwapAB,
     bool kSparseLoad,
     bool kIndexAttn,
+    bool kIntraWGOverlap,
+    bool kInnerDirMaxToMin,
     bool kReturnMaxLogits,
     bool kProfileMode>
 void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
@@ -213,7 +217,8 @@ void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
 template <
     int Arch,
     typename T,
-    typename T_out,
+    typename TDq,
+    typename TDkv,
     int kHeadDim,
     bool Has_softcap,
     bool DisableBwdDkvAtomicReduction,
@@ -223,6 +228,10 @@ template <
     bool PackGQA,
     bool CatGQA,
     int QheadPerKhead,
+    bool SparseLoad,
+    bool IndexAttn,
+    bool UseMaskDispatch,
+    bool InnerDirMaxToMin,
     bool ProfileMode>
 void run_mha_bwd_(Flash_bwd_params& params, cudaStream_t stream);
 
