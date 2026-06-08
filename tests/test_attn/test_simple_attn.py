@@ -27,6 +27,10 @@ import torch
 from magi_attention.common import AttnRanges
 from magi_attention.functional import flex_flash_attn_func
 from magi_attention.testing import parameterize
+from magi_attention.utils.sparse_utils import (
+    build_index_attn_indices,
+    get_sdpa_mask_from_index_attn_indices,
+)
 
 
 class TestSimpleAttn(unittest.TestCase):
@@ -150,9 +154,12 @@ class TestSimpleAttn(unittest.TestCase):
 
     @parameterize("cfg", INDEX_ATTN_CONFIGS)
     def test_index_attn_simple(self, cfg: dict[str, Any]):
-        """IndexAttn FWD+BWD correctness against SDPA reference."""
-        from einops import rearrange as einops_rearrange
+        """IndexAttn FWD+BWD correctness against SDPA reference.
 
+        The view trick flattens K from (B,S,NHK,D) to (B*S*NHK, 1, D), so
+        the kernel sees NHK_eff=1. Indices must be built in this flat token
+        space (NHK=1, S_flat=S*NHK) with logical positions.
+        """
         from magi_attention.utils import set_random_seed
 
         set_random_seed(42)
@@ -166,39 +173,27 @@ class TestSimpleAttn(unittest.TestCase):
         )
         pack_gqa = cfg["pack_gqa"]
         device = self.device
-        total_q = B * S
 
-        indices = torch.full((total_q, NHK, topk), -1, dtype=torch.int32, device=device)
-        for b in range(B):
-            for qi in range(S):
-                row = b * S + qi
-                for h in range(NHK):
-                    perm = torch.randperm(S, device=device)[:topk].sort().values
-                    global_ids = (b * S + perm) * NHK + h
-                    indices[row, h, :topk] = global_ids.int()
+        gqa = NHQ // NHK
+        S_flat = S * NHK
+        NHQ_eff = gqa
+
+        indices = build_index_attn_indices(B, 1, S_flat, S_flat, topk, topk, device)
 
         q_raw = torch.randn(B, S, NHQ, D, dtype=torch.bfloat16, device=device)
         k_raw = torch.randn(B, S, NHK, D, dtype=torch.bfloat16, device=device)
         v_raw = torch.randn(B, S, NHK, D, dtype=torch.bfloat16, device=device)
 
         q_ffa = (
-            einops_rearrange(q_raw, "b s (h1 h2) d -> (b s h1) h2 d", h1=NHK)
+            q_raw.reshape(B, S, NHK, gqa, D)
+            .permute(0, 1, 2, 3, 4)
+            .reshape(B * S * NHK, gqa, D)
             .detach()
             .clone()
             .requires_grad_(True)
         )
-        k_ffa = (
-            einops_rearrange(k_raw, "b s h d -> (b s h) 1 d")
-            .detach()
-            .clone()
-            .requires_grad_(True)
-        )
-        v_ffa = (
-            einops_rearrange(v_raw, "b s h d -> (b s h) 1 d")
-            .detach()
-            .clone()
-            .requires_grad_(True)
-        )
+        k_ffa = k_raw.reshape(B * S * NHK, 1, D).detach().clone().requires_grad_(True)
+        v_ffa = v_raw.reshape(B * S * NHK, 1, D).detach().clone().requires_grad_(True)
 
         o_sparse, _ = flex_flash_attn_func(
             q_ffa,
@@ -210,39 +205,27 @@ class TestSimpleAttn(unittest.TestCase):
             pack_gqa=pack_gqa,
         )
 
-        o_reshaped = einops_rearrange(
-            o_sparse, "(b s h1) h2 d -> b s (h1 h2) d", b=B, h1=NHK, s=S
+        mask = get_sdpa_mask_from_index_attn_indices(
+            indices, B, NHQ_eff, 1, S_flat, S_flat, device
         )
 
-        gqa = NHQ // NHK
-        mask = torch.zeros(B, NHQ, S, S, dtype=torch.bool, device=device)
+        # FWD verification (compare in flat token space)
         for b in range(B):
-            for qi in range(S):
-                row = b * S + qi
-                for h_kv in range(NHK):
-                    global_ids = indices[row, h_kv, :]
-                    valid = global_ids[global_ids >= 0].long()
-                    local_kv = valid // NHK - b * S
-                    for h_q_off in range(gqa):
-                        h_q = h_kv * gqa + h_q_off
-                        mask[b, h_q, qi, local_kv] = True
-
-        # FWD verification
-        for b in range(B):
-            q_sdpa = einops_rearrange(q_raw[b], "s h d -> 1 h s d")
-            k_sdpa = einops_rearrange(k_raw[b], "s h d -> 1 h s d")
-            v_sdpa = einops_rearrange(v_raw[b], "s h d -> 1 h s d")
-            if gqa > 1:
-                k_sdpa = k_sdpa.repeat_interleave(gqa, dim=1)
-                v_sdpa = v_sdpa.repeat_interleave(gqa, dim=1)
+            sl = slice(b * S_flat, (b + 1) * S_flat)
+            q_b = q_ffa[sl].detach().reshape(1, S_flat, NHQ_eff, D).transpose(1, 2)
+            k_b = k_ffa[sl].detach().reshape(1, S_flat, 1, D).transpose(1, 2)
+            v_b = v_ffa[sl].detach().reshape(1, S_flat, 1, D).transpose(1, 2)
+            if NHQ_eff > 1:
+                k_b = k_b.expand(1, NHQ_eff, S_flat, D)
+                v_b = v_b.expand(1, NHQ_eff, S_flat, D)
 
             with torch.no_grad():
                 o_ref = torch.nn.functional.scaled_dot_product_attention(
-                    q_sdpa, k_sdpa, v_sdpa, attn_mask=mask[b].unsqueeze(0)
+                    q_b, k_b, v_b, attn_mask=mask[b].unsqueeze(0)
                 )
-            o_ref = einops_rearrange(o_ref, "1 h s d -> s h d")
+            o_ref = o_ref.squeeze(0).transpose(0, 1)
 
-            max_diff = (o_reshaped[b].float() - o_ref.float()).abs().max().item()
+            max_diff = (o_sparse[sl].float() - o_ref.float()).abs().max().item()
             assert max_diff < 0.01, (
                 f"[test_index_attn][{cfg['name']}] "
                 f"FWD batch {b}: max_diff={max_diff:.6f} >= 0.01"
@@ -253,57 +236,43 @@ class TestSimpleAttn(unittest.TestCase):
         o_sparse.backward(do)
         dq_ffa = q_ffa.grad.clone()
 
-        dq_ref_list = []
         for b in range(B):
-            q_sdpa = (
-                einops_rearrange(q_raw[b], "s h d -> 1 h s d")
+            sl = slice(b * S_flat, (b + 1) * S_flat)
+            q_b = (
+                q_ffa[sl]
                 .detach()
                 .clone()
+                .reshape(1, S_flat, NHQ_eff, D)
+                .transpose(1, 2)
                 .requires_grad_(True)
             )
-            k_sdpa = (
-                einops_rearrange(k_raw[b], "s h d -> 1 h s d")
+            k_b = (
+                k_ffa[sl]
                 .detach()
                 .clone()
+                .reshape(1, S_flat, 1, D)
+                .transpose(1, 2)
                 .requires_grad_(True)
             )
-            v_sdpa = (
-                einops_rearrange(v_raw[b], "s h d -> 1 h s d")
+            v_b = (
+                v_ffa[sl]
                 .detach()
                 .clone()
+                .reshape(1, S_flat, 1, D)
+                .transpose(1, 2)
                 .requires_grad_(True)
             )
-            if gqa > 1:
-                k_sdpa_exp = k_sdpa.repeat_interleave(gqa, dim=1)
-                v_sdpa_exp = v_sdpa.repeat_interleave(gqa, dim=1)
-            else:
-                k_sdpa_exp = k_sdpa
-                v_sdpa_exp = v_sdpa
+            k_exp = k_b.expand(1, NHQ_eff, S_flat, D) if NHQ_eff > 1 else k_b
+            v_exp = v_b.expand(1, NHQ_eff, S_flat, D) if NHQ_eff > 1 else v_b
 
             o_ref = torch.nn.functional.scaled_dot_product_attention(
-                q_sdpa, k_sdpa_exp, v_sdpa_exp, attn_mask=mask[b].unsqueeze(0)
+                q_b, k_exp, v_exp, attn_mask=mask[b].unsqueeze(0)
             )
-            do_reshaped = einops_rearrange(
-                do, "(b s h1) h2 d -> b 1 (h1 h2) s d", b=B, h1=NHK, s=S
-            )[b]
-            o_ref.backward(do_reshaped)
-            dq_ref_list.append(q_sdpa.grad)
+            do_b = do[sl].reshape(1, S_flat, NHQ_eff, D).transpose(1, 2)
+            o_ref.backward(do_b)
 
-        dq_ref = torch.cat(dq_ref_list, dim=0)
-        dq_ref = einops_rearrange(dq_ref, "b h s d -> (b s) h d", b=B)[:total_q]
-
-        dq_ffa_reshaped = einops_rearrange(
-            dq_ffa, "(b s h1) h2 d -> b (h1 h2) s d", b=B, h1=NHK, s=S
-        )
-        dq_ref_reshaped = einops_rearrange(dq_ref, "(b s) h d -> b h s d", b=B, s=S)
-
-        for b in range(B):
-            max_dq_diff = (
-                (dq_ffa_reshaped[b].float() - dq_ref_reshaped[b].float())
-                .abs()
-                .max()
-                .item()
-            )
+            dq_ref_b = q_b.grad.squeeze(0).transpose(0, 1)
+            max_dq_diff = (dq_ffa[sl].float() - dq_ref_b.float()).abs().max().item()
             assert max_dq_diff < 0.05, (
                 f"[test_index_attn][{cfg['name']}] "
                 f"BWD batch {b}: dQ max_diff={max_dq_diff:.6f} >= 0.05"
@@ -1072,8 +1041,6 @@ class TestSimpleAttn(unittest.TestCase):
         """
         import os
 
-        from einops import rearrange as einops_rearrange
-
         from magi_attention.functional._flex_flash_attn_jit import get_ffa_jit_mod
 
         device = self.device
@@ -1135,42 +1102,36 @@ class TestSimpleAttn(unittest.TestCase):
 
             # ── Part 2: IndexAttn with non-aligned topk (padding block) ──
             B, S, NHQ_ia, NHK_ia, D = 1, 256, 32, 4, 128
-            actual_topk = 100  # not multiple of kBlockN=128 → 28 padding tokens
+            actual_topk = 100
             max_topk = 128
-            total_q_ia = B * S
-            gqa = NHQ_ia // NHK_ia
+            gqa_ia = NHQ_ia // NHK_ia
+            S_flat = S * NHK_ia
+            NHQ_eff = gqa_ia
 
-            indices = torch.full(
-                (total_q_ia, NHK_ia, max_topk), -1, dtype=torch.int32, device=device
+            indices = build_index_attn_indices(
+                B, 1, S_flat, S_flat, actual_topk, max_topk, device
             )
-            for b_i in range(B):
-                for qi in range(S):
-                    row = b_i * S + qi
-                    for h in range(NHK_ia):
-                        perm = (
-                            torch.randperm(S, device=device)[:actual_topk].sort().values
-                        )
-                        global_ids = (b_i * S + perm) * NHK_ia + h
-                        indices[row, h, :actual_topk] = global_ids.int()
 
             q_raw = torch.randn(B, S, NHQ_ia, D, dtype=dtype, device=device)
             k_raw = torch.randn(B, S, NHK_ia, D, dtype=dtype, device=device)
             v_raw = torch.randn(B, S, NHK_ia, D, dtype=dtype, device=device)
 
             q_ffa = (
-                einops_rearrange(q_raw, "b s (h1 h2) d -> (b s h1) h2 d", h1=NHK_ia)
+                q_raw.reshape(B, S, NHK_ia, gqa_ia, D)
+                .permute(0, 1, 2, 3, 4)
+                .reshape(B * S * NHK_ia, gqa_ia, D)
                 .detach()
                 .clone()
                 .requires_grad_(True)
             )
             k_ffa = (
-                einops_rearrange(k_raw, "b s h d -> (b s h) 1 d")
+                k_raw.reshape(B * S * NHK_ia, 1, D)
                 .detach()
                 .clone()
                 .requires_grad_(True)
             )
             v_ffa = (
-                einops_rearrange(v_raw, "b s h d -> (b s h) 1 d")
+                v_raw.reshape(B * S * NHK_ia, 1, D)
                 .detach()
                 .clone()
                 .requires_grad_(True)
@@ -1186,36 +1147,24 @@ class TestSimpleAttn(unittest.TestCase):
                 pack_gqa=True,
             )
 
-            o_reshaped = einops_rearrange(
-                o_sparse, "(b s h1) h2 d -> b s (h1 h2) d", b=B, h1=NHK_ia, s=S
+            ref_mask = get_sdpa_mask_from_index_attn_indices(
+                indices, B, NHQ_eff, 1, S_flat, S_flat, device
             )
 
-            # Build reference
-            ref_mask = torch.zeros(B, NHQ_ia, S, S, dtype=torch.bool, device=device)
             for b_i in range(B):
-                for qi in range(S):
-                    row = b_i * S + qi
-                    for h_kv in range(NHK_ia):
-                        gids = indices[row, h_kv, :]
-                        valid = gids[gids >= 0].long()
-                        local_kv = valid // NHK_ia - b_i * S
-                        for h_q_off in range(gqa):
-                            h_q = h_kv * gqa + h_q_off
-                            ref_mask[b_i, h_q, qi, local_kv] = True
-
-            for b_i in range(B):
-                q_sdpa = einops_rearrange(q_raw[b_i], "s h d -> 1 h s d")
-                k_sdpa = einops_rearrange(k_raw[b_i], "s h d -> 1 h s d")
-                v_sdpa = einops_rearrange(v_raw[b_i], "s h d -> 1 h s d")
-                if gqa > 1:
-                    k_sdpa = k_sdpa.repeat_interleave(gqa, dim=1)
-                    v_sdpa = v_sdpa.repeat_interleave(gqa, dim=1)
+                sl = slice(b_i * S_flat, (b_i + 1) * S_flat)
+                q_b = q_ffa[sl].detach().reshape(1, S_flat, NHQ_eff, D).transpose(1, 2)
+                k_b = k_ffa[sl].detach().reshape(1, S_flat, 1, D).transpose(1, 2)
+                v_b = v_ffa[sl].detach().reshape(1, S_flat, 1, D).transpose(1, 2)
+                if NHQ_eff > 1:
+                    k_b = k_b.expand(1, NHQ_eff, S_flat, D)
+                    v_b = v_b.expand(1, NHQ_eff, S_flat, D)
                 with torch.no_grad():
                     o_ref = torch.nn.functional.scaled_dot_product_attention(
-                        q_sdpa, k_sdpa, v_sdpa, attn_mask=ref_mask[b_i].unsqueeze(0)
+                        q_b, k_b, v_b, attn_mask=ref_mask[b_i].unsqueeze(0)
                     )
-                o_ref = einops_rearrange(o_ref, "1 h s d -> s h d")
-                max_diff = (o_reshaped[b_i].float() - o_ref.float()).abs().max().item()
+                o_ref = o_ref.squeeze(0).transpose(0, 1)
+                max_diff = (o_sparse[sl].float() - o_ref.float()).abs().max().item()
                 assert max_diff < 0.01, (
                     f"[test_inner_dir_min_to_max/index_attn] "
                     f"FWD batch {b_i}: max_diff={max_diff:.6f} >= 0.01"
