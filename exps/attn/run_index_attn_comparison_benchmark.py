@@ -39,9 +39,6 @@ NOTE on TFLOPS drop at large S:
   See .tmp/038-index-attn-bench-analysis/analysis.md for details.
 """
 
-import os
-from datetime import datetime
-
 import torch
 from baselines.attn_impl import ffa_func
 from baselines.token_sparse_attn_triton import token_sparse_attn, token_sparse_fwd
@@ -49,7 +46,13 @@ from baselines.utils import seed_everything
 from einops import rearrange
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from magi_attention.benchmarking import Benchmark, do_bench_flops, perf_report
+from magi_attention.benchmarking import (
+    BENCH_CASE_OOM,
+    Benchmark,
+    do_bench_flops,
+    gen_save_path,
+    perf_report,
+)
 
 # ─── Optional dependencies ────────────────────────────────────────────────────
 
@@ -203,7 +206,7 @@ _disabled_methods = set()
 def comparison_benchmark(S, method):
     global _cuda_corrupted
     if _cuda_corrupted or method in _disabled_methods:
-        return {"flops": [-1, -1, -1]}
+        return {"flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM]}
 
     device = torch.cuda.current_device()
     sparse_flops = 4 * S * topk * nhq * hd
@@ -329,11 +332,11 @@ def comparison_benchmark(S, method):
 
     except torch.cuda.OutOfMemoryError as e:
         print(f"[{method}] S={S}: OOM — {e}")
-        perf_dict = {"flops": [-1, -1, -1]}
+        perf_dict = {"flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM]}
         torch.cuda.empty_cache()
     except Exception as e:
         print(f"[{method}] S={S}: {e}")
-        perf_dict = {"flops": [-1, -1, -1]}
+        perf_dict = {"flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM]}
         if "CUDA error" in str(e) or "illegal memory" in str(e).lower():
             _disabled_methods.add(method)
             try:
@@ -523,7 +526,7 @@ bwd_flops_configs = [
 def bwd_benchmark(S, method):
     global _cuda_corrupted
     if _cuda_corrupted or method in _disabled_methods:
-        return {"flops": [-1, -1, -1]}
+        return {"flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM]}
 
     device = torch.cuda.current_device()
     sparse_flops = 4 * S * topk * nhq * hd * 2.5  # BWD ~2.5x FWD flops
@@ -651,11 +654,11 @@ def bwd_benchmark(S, method):
 
     except torch.cuda.OutOfMemoryError as e:
         print(f"[BWD {method}] S={S}: OOM — {e}")
-        perf_dict = {"flops": [-1, -1, -1]}
+        perf_dict = {"flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM]}
         torch.cuda.empty_cache()
     except Exception as e:
         print(f"[BWD {method}] S={S}: {e}")
-        perf_dict = {"flops": [-1, -1, -1]}
+        perf_dict = {"flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM]}
         if "CUDA error" in str(e) or "illegal memory" in str(e).lower():
             _disabled_methods.add(method)
             try:
@@ -745,12 +748,7 @@ if __name__ == "__main__":
                 args={},
             )
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    current_time = datetime.strftime(datetime.now(), "%Y-%m-%d_%H-%M-%S")
-    out_root = os.path.join(
-        script_dir,
-        os.path.join("outs", f"bench_index_attn_comparison_{current_time}"),
-    )
+    out_root = gen_save_path("bench_index_attn_comparison")
 
     # Sanity check before benchmarking — auto-disable methods that crash
     if not args.skip_sanity:
@@ -771,7 +769,10 @@ if __name__ == "__main__":
         print("FWD Benchmark")
         print("=" * 60)
         comparison_benchmark.run(
-            print_data=True, print_value_on_bar=False, save_path=out_root
+            print_data=True,
+            print_value_on_bar=False,
+            save_path=out_root,
+            num_workers=torch.cuda.device_count(),
         )
 
     # BWD benchmark
@@ -779,4 +780,9 @@ if __name__ == "__main__":
         print("\n" + "=" * 60)
         print("BWD Benchmark")
         print("=" * 60)
-        bwd_benchmark.run(print_data=True, print_value_on_bar=False, save_path=out_root)
+        bwd_benchmark.run(
+            print_data=True,
+            print_value_on_bar=False,
+            save_path=out_root,
+            num_workers=torch.cuda.device_count(),
+        )

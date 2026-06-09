@@ -22,15 +22,18 @@ X-axis: ratio (NHQ / NHK)
 Fixed:  S=32768, topk=1024, NHQ=128, D=128, PackGQA=True
 """
 
-import os
-from datetime import datetime
-
 import torch
 from baselines.attn_impl import ffa_func
 from baselines.utils import seed_everything
 from einops import rearrange
 
-from magi_attention.benchmarking import Benchmark, do_bench_flops, perf_report
+from magi_attention.benchmarking import (
+    BENCH_CASE_OOM,
+    Benchmark,
+    do_bench_flops,
+    gen_save_path,
+    perf_report,
+)
 
 
 def build_index_attn_indices(b, S, nhk, topk, device):
@@ -129,20 +132,19 @@ def head_group_benchmark(ratio, line_label):
                 f"Error running ratio={ratio} swap_ab={swap_ab} "
                 f"when S={S}, hd={hd}: {e=}"
             )
-        perf_dict = {"flops": [-1, -1, -1]}
+        perf_dict = {"flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM]}
         print(f"Error: {e}")
 
     return perf_dict
 
 
 if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    current_time = datetime.strftime(datetime.now(), "%Y-%m-%d_%H-%M-%S")
-    out_root = os.path.join(
-        script_dir,
-        os.path.join("outs", f"bench_attn_ffa_index_attn_head_group_{current_time}"),
-    )
+    out_root = gen_save_path("bench_attn_ffa_index_attn_head_group")
 
     head_group_benchmark.run(
-        print_data=True, print_value_on_bar=False, save_path=out_root
+        print_data=True,
+        print_value_on_bar=False,
+        save_path=out_root,
+        # only 1 benchmark here; bump to torch.cuda.device_count() if more are added
+        num_workers=1,
     )

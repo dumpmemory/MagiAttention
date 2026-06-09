@@ -23,14 +23,17 @@ Compares the two BWD loop directions in a dense (full/causal) scenario:
 Also includes FA3 and cuDNN as reference baselines.
 """
 
-import os
-from datetime import datetime
-
 import torch
 from baselines.attn_impl import cudnn_fused_attn_func, fa3_func
 from baselines.utils import calculate_attn_flops
 
-from magi_attention.benchmarking import Benchmark, do_bench_flops, perf_report
+from magi_attention.benchmarking import (
+    BENCH_CASE_OOM,
+    Benchmark,
+    do_bench_flops,
+    gen_save_path,
+    perf_report,
+)
 from magi_attention.common.enum import AttnMaskType
 from magi_attention.common.range import AttnRange  # noqa: F401
 from magi_attention.common.ranges import AttnRanges
@@ -184,11 +187,11 @@ def bwd_loop_benchmark(seqlen, method):
 
     except torch.cuda.OutOfMemoryError as e:
         print(f"[{method}] seqlen={seqlen}: OOM — {e}")
-        perf_dict = {"flops": [-1, -1, -1]}
+        perf_dict = {"flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM]}
         torch.cuda.empty_cache()
     except Exception as e:
         print(f"[{method}] seqlen={seqlen}: {e}")
-        perf_dict = {"flops": [-1, -1, -1]}
+        perf_dict = {"flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM]}
         torch.cuda.empty_cache()
 
     torch.cuda.empty_cache()
@@ -236,11 +239,7 @@ if __name__ == "__main__":
             args={},
         )
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    current_time = datetime.strftime(datetime.now(), "%Y-%m-%d_%H-%M-%S")
-    out_root = os.path.join(
-        script_dir, os.path.join("outs", f"bench_bwd_loopq_loopk_{current_time}")
-    )
+    out_root = gen_save_path("bench_bwd_loopq_loopk")
 
     print(f"Configuration: nhq={nhq}, nhk={nhk}, D={hd}, mask={MASK_TYPE}")
     print(f"seqlen_vals={seqlen_vals}")
@@ -248,5 +247,9 @@ if __name__ == "__main__":
     print()
 
     bwd_loop_benchmark.run(
-        print_data=True, print_value_on_bar=False, save_path=out_root
+        print_data=True,
+        print_value_on_bar=False,
+        save_path=out_root,
+        # only 1 benchmark here; bump to torch.cuda.device_count() if more are added
+        num_workers=1,
     )

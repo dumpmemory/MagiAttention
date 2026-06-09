@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from datetime import datetime
-
 import torch
 from baselines.attn_impl import ffa_func
 from baselines.utils import (
@@ -24,7 +21,13 @@ from baselines.utils import (
     seqlens2curanges,
 )
 
-from magi_attention.benchmarking import Benchmark, do_bench_flops, perf_report
+from magi_attention.benchmarking import (
+    BENCH_CASE_OOM,
+    Benchmark,
+    do_bench_flops,
+    gen_save_path,
+    perf_report,
+)
 from magi_attention.common.enum import AttnMaskType
 from magi_attention.common.range import AttnRange
 from magi_attention.common.ranges import AttnRanges
@@ -267,7 +270,7 @@ def attn_benchmark(seqlen, hd, wd, mask_type, sparse_load):
                 raise e
             # Handle OOM in wrapper usually, but here we prep for backward
             return {
-                "flops": [-1, -1, -1],
+                "flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM],
             }
 
         def fn_bwd():
@@ -307,10 +310,10 @@ def attn_benchmark(seqlen, hd, wd, mask_type, sparse_load):
                 f"when {seqlen=}, {hd=} during {wd}: {e=}"
             )
             raise e
-        # -1 indicates oom
+        # BENCH_CASE_OOM indicates oom
         perf_dict = {
-            "flops": [-1, -1, -1],
-            # "mem": [-1, -1, -1],
+            "flops": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM],
+            # "mem": [BENCH_CASE_OOM, BENCH_CASE_OOM, BENCH_CASE_OOM],
         }
         print(
             f"OOM error occured when running for ffa (sparse_load={sparse_load}) with {mask_type} mask "
@@ -321,10 +324,12 @@ def attn_benchmark(seqlen, hd, wd, mask_type, sparse_load):
 
 
 if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    current_time = datetime.strftime(datetime.now(), "%Y-%m-%d_%H-%M-%S")
-    out_root = os.path.join(
-        script_dir, os.path.join("outs", f"bench_attn_ffa_sparseload_{current_time}")
-    )
+    out_root = gen_save_path("bench_attn_ffa_sparseload")
 
-    attn_benchmark.run(print_data=True, print_value_on_bar=False, save_path=out_root)
+    attn_benchmark.run(
+        print_data=True,
+        print_value_on_bar=False,
+        save_path=out_root,
+        # only 1 benchmark here; bump to torch.cuda.device_count() if more are added
+        num_workers=1,
+    )

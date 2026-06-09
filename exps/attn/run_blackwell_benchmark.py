@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from datetime import datetime
 from typing import Any
 
 import torch
@@ -64,7 +62,12 @@ from einops import rearrange
 
 from exps.dist_attn.benchmark.enums import FlashMaskType
 from exps.dist_attn.benchmark.mask import MaskIterator
-from magi_attention.benchmarking import Benchmark, do_bench_flops, perf_report
+from magi_attention.benchmarking import (
+    Benchmark,
+    do_bench_flops,
+    gen_save_path,
+    perf_report,
+)
 from magi_attention.common.enum import AttnMaskType
 from magi_attention.utils._utils import make_attn_mask_from_ffa_args
 
@@ -967,8 +970,8 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl, mask_nums):
                         fn,
                         quantiles=quantiles,
                         mem_record_mode="peak",
-                        warmup=5,
-                        rep=20,
+                        warmup_iters=5,
+                        rep_iters=20,
                         **do_bench_kwargs,
                     )
 
@@ -1036,13 +1039,15 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl, mask_nums):
 
 
 if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    current_time = datetime.strftime(datetime.now(), "%Y-%m-%d_%H-%M-%S")
-    out_root = os.path.join(
-        script_dir, os.path.join("outs", f"bench_attn_{current_time}")
-    )
+    out_root = gen_save_path("bench_attn")
 
-    attn_benchmark.run(print_data=True, print_value_on_bar=False, save_path=out_root)
+    attn_benchmark.run(
+        print_data=True,
+        print_value_on_bar=False,
+        save_path=out_root,
+        # only 1 benchmark here; bump to torch.cuda.device_count() if more are added
+        num_workers=1,
+    )
 
     del _MASK_ITERATOR_CACHE
     _MASK_ITERATOR_CACHE = None  # type: ignore[assignment]
