@@ -59,7 +59,8 @@ template <
     bool SwapAB_,
     bool SparseLoad_,
     bool IndexAttn_,
-    bool InnerDirMaxToMin_>
+    bool InnerDirMaxToMin_,
+    int MaskMode_ = 1>
 struct CollectiveMainloopFwdSm90 {
   using ClusterShape = ClusterShape_;
   using TileShape_MNK = TileShape_MNK_;
@@ -83,6 +84,7 @@ struct CollectiveMainloopFwdSm90 {
   static constexpr bool IndexAttn = IndexAttn_;
   static_assert(!(SparseLoad && IndexAttn), "SparseLoad and IndexAttn cannot be enabled at the same time");
   static constexpr bool InnerDirMaxToMin = InnerDirMaxToMin_;
+  static constexpr int MaskMode = MaskMode_;
 
   // Get the block size and head dimension from the TileShapeMNK for code readability
   static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1242,10 +1244,8 @@ struct CollectiveMainloopFwdSm90 {
       ++work_idx;
     };
 
-    // Unified MMA body: sparse compile-time selects mask by direction.
-    //   MaxToMin: body blocks are guaranteed padding-free → no_mask (perf win).
-    //   MinToMax: last body block may need padding → runtime check.
-    // Dense uses mask_dispatch_unified for the full range.
+    // MMA body: sparse uses compile-time direction for mask selection;
+    // Dense uses mask_dispatch (3-lambda, compile-time zone splitting) for zero-overhead inner loop.
     auto mma_body = [&]() {
       if constexpr (SparseLoad || IndexAttn) {
         if (block_meta.is_finish())
@@ -1259,7 +1259,33 @@ struct CollectiveMainloopFwdSm90 {
         }
         return;
       }
-      mask_dispatch_unified<kBlockM, kBlockN, PackGQA, QheadPerKhead, DispatchAxis::N, kInnerDir>(block_meta, mask, tSrS, thread_idx, fwd_step);
+      if constexpr (MaskMode == 0) {
+        // MaskMode 0 (regular): direct apply with Seqlenk_mask=true on every block.
+        auto direct_mask_fn = [&](int n_block) {
+          mask.template apply</*Seqlenk_mask=*/true, PackGQA, QheadPerKhead>(
+              tSrS, m_block, n_block, block_meta.attn_type, thread_idx, block_meta.seqlen_info.seqlen_q, block_meta.seqlen_info.seqlen_k);
+        };
+        flash::iterate_range<kInnerDir>(block_meta.inner_block_cur, block_meta.inner_block_min, block_meta.inner_block_max, [&] {
+          fwd_step(block_meta.inner_block_cur, direct_mask_fn, cute::false_type{});
+        });
+      } else if constexpr (MaskMode == 1) {
+        // MaskMode 1 (dispatch): 3-lambda zone splitting (current default).
+        mask_dispatch<kBlockM, kBlockN, PackGQA, QheadPerKhead, DispatchAxis::N, kInnerDir>(
+            block_meta.inner_block_cur,
+            block_meta.inner_block_min,
+            block_meta.inner_block_max,
+            m_block,
+            block_meta.seqlen_info.seqlen_q,
+            block_meta.seqlen_info.seqlen_k,
+            block_meta.attn_type,
+            fwd_step,
+            boundary_mask_fn,
+            regular_mask_fn,
+            no_mask_fn);
+      } else {
+        // MaskMode 2 (unified): mask_dispatch_unified with runtime zone dispatch.
+        flash::mask_dispatch_unified<kBlockM, kBlockN, PackGQA, QheadPerKhead, flash::DispatchAxis::N, kInnerDir>(block_meta, mask, tSrS, thread_idx, fwd_step);
+      }
     };
 
     // ─── Unified MMA control flow ───
