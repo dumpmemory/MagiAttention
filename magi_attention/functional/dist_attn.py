@@ -1311,12 +1311,12 @@ class DistAttnRuntime:
                     sm_margin=self.fwd_sm_margin,
                     # optional args below mainly for sparse attn
                     ref_block_size=None,
-                    max_seqlen_q=None,
-                    auto_range_merge=env.general.is_auto_range_merge_enable(),
+                    max_outer_range_width=None,
+                    range_merge=env.general.is_range_merge_enable(),
                     swap_ab=False,
                     pack_gqa=False,
-                    sparse_load=False,
-                    index_attn=False,
+                    block_sparse=False,
+                    index_sparse=False,
                     return_max_logits=return_max_logits,
                     max_logits=max_logits_acc,  # directly reduce to max_logits_acc
                 )
@@ -1440,11 +1440,12 @@ class DistAttnRuntime:
                     dk_type=self.hp_dtype,
                     dv_type=self.hp_dtype,
                     disable_bwd_dkv_atomic_reduction=attn_arg.disable_bwd_dkv_atomic_reduction,
+                    disable_bwd_dq_atomic_reduction=False,
                     deterministic=self.deterministic,
                     sm_margin=self.bwd_sm_margin,
                     # optional args below mainly for sparse attn
-                    auto_range_merge=env.general.is_auto_range_merge_enable(),
-                    swap_bwd_qk_loop=False,
+                    range_merge=env.general.is_range_merge_enable(),
+                    bwd_inner_loop_k=False,
                     cat_gqa=env.general.is_cat_gqa_enable(),
                 )
 

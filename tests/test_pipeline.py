@@ -14,6 +14,7 @@
 
 import os
 import random
+from itertools import product
 from typing import Any
 
 import torch
@@ -82,6 +83,94 @@ BACKENDS = "backends"
 
 # TODO: rewrite the specific function for unitest profiling mode
 class TestPipelineBaseWithWorldSize1(DistTestBase):
+    # Dense feature combos for pipeline / flex_flash_attn precompile.
+    # Generated via itertools.product + filter; superset of legacy hand-picked list.
+    _DENSE_FEATURE_AXES = dict(
+        disable_atomic=[False],
+        deterministic=[False, True],
+        range_merge=[False, True],
+        cat_gqa=[False, True],
+        bwd_inner_loop_k=[False, True],
+        pack_gqa_factor=[1, 8, 128],
+        return_max_logits=[False, True],
+    )
+
+    @classmethod
+    def _is_valid_dense_feature(
+        cls,
+        disable_atomic: bool,
+        deterministic: bool,
+        range_merge: bool,
+        cat_gqa: bool,
+        bwd_inner_loop_k: bool,
+        pack_gqa_factor: int,
+        return_max_logits: bool,
+    ) -> bool:
+        if disable_atomic:
+            return False
+        if cat_gqa and pack_gqa_factor <= 1:
+            return False
+        if cat_gqa and bwd_inner_loop_k:
+            return False
+        if cat_gqa and return_max_logits:
+            return False
+        if return_max_logits and bwd_inner_loop_k:
+            return False
+        if return_max_logits and pack_gqa_factor == 128:
+            return False
+        if deterministic and bwd_inner_loop_k:
+            return False
+        return True
+
+    @classmethod
+    def _iter_dense_features(cls):
+        keys = list(cls._DENSE_FEATURE_AXES.keys())
+        for values in product(*(cls._DENSE_FEATURE_AXES[k] for k in keys)):
+            combo = dict(zip(keys, values))
+            if cls._is_valid_dense_feature(**combo):
+                yield combo
+
+    @classmethod
+    def precompile_kernel_specs(cls):
+        """Standard precompile interface — see magi_attention/testing/precompile.py.
+
+        Dense extras: feature flag combos × hd × compute_dtype × direction.
+        These kernels are NOT sparse — they cover deterministic, ARM,
+        cat_gqa, return_max_logits, bwd_inner_loop_k flag combos used by
+        test_pipeline and test_flex_flash_attn.
+        """
+        from magi_attention.testing.precompile import add_ffa_spec
+
+        specs: dict = {}
+        for hd in [64, 128]:
+            for compute_dt in [torch.float16, torch.bfloat16]:
+                for feat in cls._iter_dense_features():
+                    det = feat["deterministic"]
+                    arm = feat["range_merge"]
+                    cat = feat["cat_gqa"]
+                    swap = feat["bwd_inner_loop_k"]
+                    pgf = feat["pack_gqa_factor"]
+                    rml = feat["return_max_logits"]
+                    directions = ["fwd"] if rml else ["fwd", "bwd"]
+                    for direction in directions:
+                        use_cat = cat and direction == "bwd"
+                        pack_gqa = pgf > 1 and not use_cat
+                        add_ffa_spec(
+                            specs,
+                            direction=direction,
+                            head_dim=hd,
+                            compute_dtype=compute_dt,
+                            output_dtype=torch.float32 if direction == "fwd" else None,
+                            deterministic=det,
+                            range_merge=arm,
+                            pack_gqa=pack_gqa,
+                            cat_gqa=use_cat,
+                            pack_gqa_factor=pgf if not use_cat else 1,
+                            bwd_inner_loop_k=swap and direction == "bwd",
+                            return_max_logits=rml,
+                        )
+        return specs
+
     def init_pg(self) -> None:
         super().init_pg()
 
