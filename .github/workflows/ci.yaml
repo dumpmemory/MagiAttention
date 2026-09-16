@@ -17,6 +17,7 @@ env:
   CI_WORKSPACE_ROOT: /home/niubility2/ci_workspace
   TASK_CI_PLATFORM: h100
   TASK_CI_BASE_IMAGE: registry.cn-sh-01.sensecore.cn/sandai-ccr/magi-base:26.05.2
+  STANDALONE_ARTIFACT_NAMESPACE: magi-attention
   NCCL_NVLS_ENABLE: '0'
   VALIDATION_CACHE_TRUSTED: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
 
@@ -27,8 +28,8 @@ jobs:
       pull-requests: read
       contents: read
     outputs:
-      MagiAttention: ${{ steps.filter.outputs.MagiAttention }}
-      MagiAttnExtensions: ${{ steps.filter.outputs.MagiAttnExtensions }}
+      MagiAttention: ${{ steps.package_changes.outputs.MagiAttention }}
+      MagiAttnExtensions: ${{ steps.package_changes.outputs.MagiAttnExtensions }}
       ci_protocol: ${{ steps.filter.outputs.ci_protocol }}
       trusted: ${{ steps.trust.outputs.trusted }}
     steps:
@@ -41,27 +42,31 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: bash .github/scripts/check_pr_title.sh
+      - name: Fetch pull request head for change detection
+        if: github.event_name == 'pull_request_target'
+        env:
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags "https://github.com/$HEAD_REPOSITORY.git" "$HEAD_SHA"
+      - name: Detect package changes from policy
+        id: package_changes
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python .github/scripts/ci_input_policy.py validate
+          echo "MagiAttention=$(python .github/scripts/ci_input_policy.py changed --layer trigger --node magi_attention --base "$BASE_SHA" --head "$HEAD_SHA")" >> "$GITHUB_OUTPUT"
+          echo "MagiAttnExtensions=$(python .github/scripts/ci_input_policy.py changed --layer trigger --node magi_attn_extensions --base "$BASE_SHA" --head "$HEAD_SHA")" >> "$GITHUB_OUTPUT"
       - uses: dorny/paths-filter@v2
         id: filter
         with:
           filters: |
-            MagiAttention:
-              - '**'
-              - '!extensions/**'
-              - '!.github/**'
-              - '!docs/**'
-            MagiAttnExtensions:
-              - 'extensions/**'
             ci_protocol:
-              - '.github/workflows/build_test.yaml'
+              - '.github/ci_input_policy.json'
+              - '.github/ci_dependencies.json'
+              - '.github/workflows/ci.yaml'
               - '.github/workflows/base_image_tag.txt'
-              - '.github/scripts/check_pr_title.sh'
-              - '.github/scripts/install_requirements.sh'
-              - '.github/scripts/build_v2_wheel.sh'
-              - '.github/scripts/portable_validation.sh'
-              - '.github/scripts/run_build_tests.sh'
-              - '.github/scripts/test_portable_validation.sh'
-              - '.github/scripts/verify_task_runner.sh'
+              - '.github/scripts/**'
       - name: Determine trust
         id: trust
         run: echo "trusted=${{ env.VALIDATION_CACHE_TRUSTED }}" >> "$GITHUB_OUTPUT"
@@ -85,6 +90,8 @@ jobs:
       https_proxy: ${{ secrets.HTTP_PROXY }}
       no_proxy: pypi.tuna.tsinghua.edu.cn
       GITHUB_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      DEPENDENCY_REPO_TOKEN: ${{ secrets.DEPENDENCY_REPO_TOKEN }}
+      CI_DEPENDENCY_USE_TOKEN: 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,6 +99,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
           fetch-depth: 0
+          persist-credentials: false
       - name: Use runner-local artifacts for fork PR
         if: needs.detect_changes.outputs.trusted != 'true'
         run: echo "CI_WORKSPACE_ROOT=$RUNNER_TEMP/magi-attention-ci" >> "$GITHUB_ENV"
@@ -104,14 +112,21 @@ jobs:
           git config user.email github-actions@github.com
           git fetch https://github.com/${{ github.repository }}.git "$BASE_REF"
           git merge FETCH_HEAD
-      - name: Build and test
-        run: bash .github/scripts/run_build_tests.sh "$MAIN_CHANGED" "$CI_CHANGED" "$TRUSTED"
+      - name: Verify task runner
+        run: bash .github/scripts/verify_task_runner.sh
+      - name: Install dependencies
+        run: bash .github/scripts/run_build_tests.sh install
+      - name: Build wheels
+        run: bash .github/scripts/run_build_tests.sh build
+      - name: Test packages
+        id: test
+        run: bash .github/scripts/run_build_tests.sh test "$MAIN_CHANGED" "$CI_CHANGED" "$TRUSTED"
         env:
           MAIN_CHANGED: ${{ needs.detect_changes.outputs.MagiAttention }}
           CI_CHANGED: ${{ needs.detect_changes.outputs.ci_protocol }}
           TRUSTED: ${{ needs.detect_changes.outputs.trusted }}
       - name: Upload coverage reports to Codecov
-        if: needs.detect_changes.outputs.MagiAttention == 'true' || needs.detect_changes.outputs.ci_protocol == 'true'
+        if: steps.test.outputs.coverage_generated == 'true'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

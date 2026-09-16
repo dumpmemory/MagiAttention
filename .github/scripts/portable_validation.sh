@@ -17,6 +17,7 @@
 set -euo pipefail
 
 PORTABLE_SCHEMA=1
+PORTABLE_RECIPE_VERSION=3
 PORTABLE_ROOT="${CI_WORKSPACE_ROOT:-/workspace}/v2/portable-validations/magi-attention"
 PORTABLE_PRODUCER=SandAI-org/MagiAttention
 
@@ -44,55 +45,41 @@ base_tag() {
 
 source_digest() {
     local node=${1:?node is required}
+    local policy helper
     check_node "$node"
     git -C "$repo_root" diff --quiet -- "$source_root" &&
         git -C "$repo_root" diff --cached --quiet -- "$source_root" || {
         echo "Refusing to certify a dirty MagiAttention worktree" >&2
         return 3
     }
-    python - "$repo_root" "$source_root" "$node" <<'PY'
-import hashlib
-import os
-import subprocess
-import sys
-from pathlib import PurePosixPath
-
-repo, source, node = sys.argv[1:]
-prefix = PurePosixPath(source)
-output = subprocess.check_output(
-    ["git", "-C", repo, "ls-files", "--stage", "-z", "--", source]
-)
-lines = []
-for record in output.split(b"\0"):
-    if not record:
-        continue
-    metadata, raw_path = record.split(b"\t", 1)
-    mode, oid, stage = metadata.decode("ascii").split()
-    if stage != "0":
-        raise SystemExit("Cannot certify unresolved merge conflicts")
-    path = PurePosixPath(os.fsdecode(raw_path))
-    relative = path if source == "." else path.relative_to(prefix)
-    if relative == PurePosixPath(".github") or PurePosixPath(".github") in relative.parents:
-        continue
-    in_extensions = (
-        relative == PurePosixPath("extensions")
-        or PurePosixPath("extensions") in relative.parents
-    )
-    if node == "magi_attention" and in_extensions:
-        continue
-    if node == "magi_attn_extensions" and not in_extensions:
-        continue
-    object_type = "commit" if mode == "160000" else "blob"
-    lines.append(f"{mode} {object_type} {oid}\t{relative.as_posix()}")
-if not lines:
-    raise SystemExit(f"No tracked source inputs found for {node}")
-payload = "\n".join(sorted(lines, key=os.fsencode)) + "\n"
-print(hashlib.sha256(payload.encode()).hexdigest())
-PY
+    policy="$repo_root/$source_root/.github/ci_input_policy.json"
+    helper="$repo_root/$source_root/.github/scripts/ci_input_policy.py"
+    python "$helper" --repo-root "$repo_root" --policy "$policy" \
+        digest --layer portable --node "$node"
 }
 
 recipe_digest() {
-    sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}'
+    local node=${1:?node is required}
+    python - "$repo_root/$source_root/.github/ci_input_policy.json" "$node" "$PORTABLE_RECIPE_VERSION" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+path, node, recipe = sys.argv[1:]
+policy = json.loads(Path(path).read_text())
+projection = {
+    "exclusions": sorted(policy["nodes"][node]["exclusions"]["portable"]),
+    "layer": "portable",
+    "node": node,
+    "protocol": "magi-attention-portable-v1",
+    "recipe_version": int(recipe),
+    "root": policy["nodes"][node]["root"],
+    "version": policy["version"],
+}
+payload = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+print(hashlib.sha256(payload).hexdigest())
+PY
 }
 
 inputs_json() {
@@ -104,7 +91,7 @@ inputs_json() {
     fi
     tag=$(base_tag) || return
     source=$(source_digest "$node") || return
-    recipe=$(recipe_digest) || return
+    recipe=$(recipe_digest "$node") || return
     python - "$PORTABLE_SCHEMA" "$node" "$tag" \
         "${TASK_CI_PLATFORM:-h100}" "$source" "$dependency" "$recipe" <<'PY'
 import json
@@ -238,27 +225,53 @@ PY
 }
 
 run_test() {
+    local test_cwd package_root clean_pythonpath
+    package_root=$(cd "$repo_root/$source_root" && pwd)
+    test_cwd=$(mktemp -d "${RUNNER_TEMP:-/tmp}/magi-attention-wheel-tests.XXXXXX")
+    trap 'rm -rf "$test_cwd"' RETURN
+    clean_pythonpath=$(python - "$repo_root" "$package_root" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+excluded = {Path(path).resolve() for path in sys.argv[1:]}
+print(os.pathsep.join(
+    entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    if entry and Path(entry).resolve() not in excluded
+))
+PY
+    )
     case "${1:?node is required}" in
         magi_attention)
             if [[ "${PORTABLE_VALIDATION_COVERAGE:-false}" == true ]]; then
-                MAGI_ATTENTION_TEST_PRINT_NO_MISMATCH=0 \
+                (cd "$test_cwd" && \
+                    PYTHONPATH="$clean_pythonpath" \
+                    COVERAGE_FILE="$repo_root/.coverage" \
+                    MAGI_ATTENTION_TEST_PRINT_NO_MISMATCH=0 \
                     MAGI_ATTENTION_TEST_BACKEND="sdpa,ffa" \
                     coverage run --source magi_attention -m pytest \
-                        -q -s --skip-slow --import-mode=append "$source_root/tests"
-                coverage combine
-                coverage xml -i
+                        -q -s --skip-slow --import-mode=append "$package_root/tests")
+                (cd "$repo_root" && coverage combine && coverage xml -i)
             else
-                MAGI_ATTENTION_TEST_PRINT_NO_MISMATCH=0 \
+                (cd "$test_cwd" && \
+                    PYTHONPATH="$clean_pythonpath" \
+                    MAGI_ATTENTION_TEST_PRINT_NO_MISMATCH=0 \
                     MAGI_ATTENTION_TEST_BACKEND="sdpa,ffa" \
-                    pytest -q -s --skip-slow --import-mode=append "$source_root/tests"
+                    python -m pytest -q -s --skip-slow --import-mode=append \
+                        "$package_root/tests")
             fi
             ;;
         magi_attn_extensions)
-            MAGI_ATTENTION_TEST_PRINT_NO_MISMATCH=0 \
-                pytest -q -s --skip-slow --import-mode=append "$source_root/extensions/tests"
+            (cd "$test_cwd" && \
+                PYTHONPATH="$clean_pythonpath" \
+                MAGI_ATTENTION_TEST_PRINT_NO_MISMATCH=0 \
+                python -m pytest -q -s --skip-slow --import-mode=append \
+                    "$package_root/extensions/tests")
             ;;
         *) check_node "$1" ;;
     esac
+    rm -rf "$test_cwd"
+    trap - RETURN
 }
 
 case "${1:-}" in
